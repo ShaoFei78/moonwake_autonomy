@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>moonwake_sensor_status</name>
+  <version>0.1.0</version>
+  <description>Simulated front camera status heartbeat for ROS 2 training.</description>
+  <maintainer email="training@example.com">Moonwake Training</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
