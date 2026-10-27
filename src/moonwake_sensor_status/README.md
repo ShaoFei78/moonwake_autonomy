@@ -26,3 +26,4 @@ ros2 run moonwake_sensor_status sensor_status_node
 ```
 
 在另一个已加载相同工作区的终端中，可使用 `ros2 node list` 和 `ros2 node info /front_camera_status` 观察运行状态。按 `Ctrl+C` 退出。
+使用'ros2 service call /set_detailed_log std_srvs/srv/SetBool "{data: true}"'打开跟详细的日志输出

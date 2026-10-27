@@ -3,9 +3,10 @@ project(moonwake_sensor_status)
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(std_srvs REQUIRED)
 
 add_executable(sensor_status_node src/sensor_status_node.cpp)
-ament_target_dependencies(sensor_status_node rclcpp)
+ament_target_dependencies(sensor_status_node rclcpp std_srvs)
 
 install(TARGETS sensor_status_node
   DESTINATION lib/${PROJECT_NAME})
