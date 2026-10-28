@@ -11,6 +11,10 @@ add_executable(talker_node src/talker_node.cpp)
 ament_target_dependencies(talker_node rclcpp std_msgs)
 add_executable(listener_node src/listener_node.cpp)
 ament_target_dependencies(listener_node rclcpp std_msgs)
+add_executable(target_offset_publisher src/target_offset_publisher.cpp)
+ament_target_dependencies(target_offset_publisher rclcpp std_msgs)
+add_executable(steering_hint_node src/steering_hint_node.cpp)
+ament_target_dependencies(steering_hint_node rclcpp std_msgs)
 
 install(TARGETS heartbeat_node
   DESTINATION lib/${PROJECT_NAME})
@@ -18,6 +22,11 @@ install(TARGETS talker_node
   DESTINATION lib/${PROJECT_NAME})
 install(TARGETS listener_node
   DESTINATION lib/${PROJECT_NAME})
+install(TARGETS
+  target_offset_publisher
+  steering_hint_node
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 install(DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME})

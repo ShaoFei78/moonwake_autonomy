@@ -1,0 +1,8 @@
+target_offset_publisher:
+  ros__parameters:
+    amplitude: 0.8
+    publish_hz: 1.0
+
+steering_hint_node:
+  ros__parameters:
+    deadband: 0.10
