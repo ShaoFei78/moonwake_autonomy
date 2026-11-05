@@ -1,0 +1,46 @@
+# moonwake_camera 检测参数
+#
+# 加载方式：
+#   ros2 run moonwake_camera buoy_detector_node --ros-args \
+#     --params-file ~/moonwake_autonomy/src/moonwake_camera/config/detector_params.yaml
+#
+# 注意：
+#   * 顶层 key 必须和节点名一致（Node("buoy_detector_node")），否则参数不会生效
+#   * OpenCV 的 H 范围是 0~180（不是 0~360），这里填的都是 OpenCV 口径
+#   * 这里只写了「启动时读取」的参数；节点支持动态改的（h_min 等）可以用 ros2 param set 实时调
+
+buoy_detector_node:
+  ros__parameters:
+    # ── HSV 阈值 ────────────────────────────────────────────
+    # H: 0~180（对应 0~360 度）；S/V: 0~255
+    h_min: 34
+    h_max: 84
+    s_min: 42
+    s_max: 255
+    v_min: 40
+    v_max: 255
+
+    # ── 连通域过滤 ──────────────────────────────────────────
+    # 面积小于 min_area 的连通域会被丢弃，单位是像素
+    min_area: 60
+    # 形态学核大小，getStructuringElement(MORPH_ELLIPSE, Size(k,k))
+    kernel_size: 5
+
+    # ── 时序 ────────────────────────────────────────────────
+    # 数据年龄超过这个值判为 STATUS_INPUT_STALE（秒）
+    # 用视频回放测试时，发布端时间戳是"当前时刻"，这个值保持 0.5 即可
+    stale_threshold_sec: 0.5
+
+    # ── 调试 ────────────────────────────────────────────────
+    # 把处理后的 mask 发布到 debug_mask 话题，调参阶段建议开
+    publish_debug_mask: true
+
+    # ── 异常样本保存 ────────────────────────────────────────
+    save_failure_samples: true
+    # 留空 = 自动存到 <本包目录>/failure_samples/
+    # 想换个地方就写绝对路径，例如 /home/shaofei/data/samples
+    failure_dir: ""
+    # 两次落盘的最小间隔（秒），防止连续失败把磁盘写满
+    failure_min_interval_sec: 10.0
+    # 单次运行最多保存多少份，<=0 表示不限制
+    failure_max_samples: 200

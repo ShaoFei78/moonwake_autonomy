@@ -1,514 +1,310 @@
 # Moonwake Autonomy
 
-Moonwake Autonomy 是一个基于 ROS 2 Humble 和 C++ 的入门示例工作区。项目包含两个 ROS 2 Package，用于练习节点、Topic、Service、参数、Launch 文件以及简单的发布/订阅数据流。
+基于 **ROS 2 Humble + OpenCV** 的视觉检测工作区，目前只包含一个包 `moonwake_camera`：用 HSV 阈值 + 连通域分析从相机图像中检测浮标，并附带失败样本记录、参数调试和性能评估工具。
 
-当前代码不连接真实相机或其他传感器，也不包含车辆控制算法。相机状态、目标偏移和转向提示均为模拟数据。
+> 尚未接入真实相机，可用视频文件代替，见 [测试脚本](#测试脚本)。
 
-## 当前功能
+---
 
-### `moonwake_ros2_training`
+## 运行环境
 
-| 可执行文件 | Node 名称 | 主要接口 | 说明 |
-| --- | --- | --- | --- |
-| `heartbeat_node` | `heartbeat_node` | 无 | 每秒输出一次 `node is alive` |
-| `talker_node` | `talker_node` | 发布 `/chatter` | 每 500 ms 发布一条 `std_msgs/msg/String` |
-| `listener_node` | `listener_node` | 订阅 `/chatter` | 接收并保存最新消息，默认不打印消息 |
-| `target_offset_publisher` | `target_offset_publisher` | 发布 `target_offset` | 按顺序发布模拟横向目标偏移，类型为 `std_msgs/msg/Float64` |
-| `steering_hint_node` | `steering_hint_node` | 订阅 `target_offset`，发布 `steering_hint` | 根据偏移和死区生成 `LEFT`、`RIGHT` 或 `STRAIGHT` |
+| 项目 | 要求 |
+| --- | --- |
+| 操作系统 | Ubuntu 22.04（WSL 2 亦可） |
+| ROS 2 | Humble |
+| C++ 标准 | C++17（用到 `std::filesystem`） |
+| OpenCV | 4.x（Ubuntu 22.04 自带 4.5.4，读视频需 FFMPEG 支持） |
+| Python | 3.10，依赖 `rclpy`、`cv2`、`numpy` |
+| 构建工具 | colcon + ament_cmake |
 
-该 Package 还提供 `launch/training.launch.py` 和 `config/training_params.yaml`，用于同时启动目标偏移发布节点与转向提示节点。
+```bash
+sudo apt install ros-humble-cv-bridge ros-humble-message-filters \
+                 python3-opencv python3-numpy
+```
 
-### `moonwake_sensor_status`
+---
 
-| 可执行文件 | Node 名称 | 主要接口 | 说明 |
-| --- | --- | --- | --- |
-| `sensor_status_node` | `front_camera_status` | Service `set_detailed_log` | 每秒输出模拟相机状态；可通过 `std_srvs/srv/SetBool` 切换详细日志 |
-
-## 数据流
-
-使用 Launch 文件运行时：
+## 架构与数据流
 
 ```text
-target_offset_publisher
-        │
-        │ /training/target_offset  (std_msgs/msg/Float64)
-        ▼
-steering_hint_node
-        │
-        │ /training/steering_hint  (std_msgs/msg/String)
-        ▼
-其他订阅者或 ros2 topic echo
+                     ┌────────────────────────────┐
+   真实相机 / 视频 ──►│ image_raw     sensor_msgs/Image
+                     │ camera_info   sensor_msgs/CameraInfo
+                     └──────────────┬─────────────┘
+                                    │ ApproximateTime 时间同步
+                                    ▼
+                     ┌──────────────────────────────────┐
+                     │        buoy_detector_node        │
+                     │  ① 分辨率一致性检查               │
+                     │  ② 数据年龄检查  → INPUT_STALE    │
+                     │  ③ 参数合法性检查 → CONFIG_ERROR  │
+                     │  ④ BGR→HSV → inRange             │
+                     │  ⑤ 形态学开运算 / 闭运算          │
+                     │  ⑥ 连通域 + 面积过滤              │
+                     └──┬────────────┬────────────┬─────┘
+                        │            │            │
+          detection ────┘   debug_mask│            │ failure_samples/
+        (DetectionArray)      (Image) │            │ 原图 + mask + txt
+                        ▼            ▼            ▼
+              evaluate_detector   rqt_image_view  tune_params.py
+                 → eval_result.csv                （滑动条调参）
 ```
 
-基础发布/订阅示例：
+---
+
+## 包结构
 
 ```text
-talker_node ── /chatter (std_msgs/msg/String) ──► listener_node
+moonwake_autonomy/
+└── src/moonwake_camera/
+    ├── CMakeLists.txt / package.xml
+    ├── msg/                          # Detection.msg / DetectionArray.msg
+    ├── include/moonwake_camera/      # failure_recorder.hpp
+    ├── src/                          # buoy_detector_node.cpp / failure_recorder.cpp
+    ├── config/detector_params.yaml   # 推荐参数
+    ├── launch/test_with_video.launch.py
+    ├── tools/
+    │   ├── video_publisher.py        # 视频代替相机
+    │   ├── evaluate_detector.py      # 性能评估
+    │   └── tune_params.py            # 滑动条调参
+    └── failure_samples/              # 运行时生成（已 gitignore）
 ```
 
-`target_offset_publisher` 在 Launch 文件中发布的消息依次为 `-0.8`、`-0.4`、`0.0`、`0.4`、`0.8`，随后循环。`steering_hint_node` 根据 `deadband` 参数判断方向：偏移绝对值不超过死区时为 `STRAIGHT`，小于负死区时为 `LEFT`，大于正死区时为 `RIGHT`。
+---
 
-## 项目结构
+## 节点与可执行文件
 
-```text
-moonwake_autonomy-main/
-├── README.md
-├── .gitignore
-└── src/
-    ├── moonwake_ros2_training/
-    │   ├── CMakeLists.txt
-    │   ├── package.xml
-    │   ├── config/
-    │   │   └── training_params.yaml
-    │   ├── launch/
-    │   │   └── training.launch.py
-    │   └── src/
-    │       ├── heartbeat_node.cpp
-    │       ├── listener_node.cpp
-    │       ├── steering_hint_node.cpp
-    │       ├── talker_node.cpp
-    │       └── target_offset_publisher.cpp
-    └── moonwake_sensor_status/
-        ├── CMakeLists.txt
-        ├── LICENSE
-        ├── package.xml
-        ├── README.md
-        └── src/
-            └── sensor_status_node.cpp
-```
-
-注意：`moonwake_sensor_status/CMakeLists.txt` 当前仍会安装 `launch/` 和 `config/` 目录，但 Package 中尚未提交这两个目录。首次构建前需要按后文命令创建空目录，否则安装阶段可能报目录不存在。
-
-## 环境要求
-
-- Ubuntu 22.04
-- ROS 2 Humble
-- CMake 3.8 或更高版本
-- C++ 编译器
-- `colcon`
-- `ament_cmake`
-- `rclcpp`
-- `std_msgs`
-- `std_srvs`
-- `launch_ros` / `ros2launch`
-
-如果使用 Windows，建议在 WSL 2 的 Ubuntu 22.04 中运行。以下命令均以 Linux Shell 为例。
-
-## 安装基础依赖
-
-先加载 ROS 2 环境并确认命令可用：
+| 可执行文件 | 类型 | 说明 |
+| --- | --- | --- |
+| `buoy_detector_node` | C++ 节点 | 主检测节点，ROS 名 `buoy_detector_node` |
+| `video_publisher.py` | Python 节点 | 读视频文件，充当相机发布图像 |
+| `evaluate_detector.py` | Python 节点 | 订阅检测结果，统计指标并写 CSV |
+| `tune_params.py` | Python 工具 | 带滑动条的离线调参（不发布话题） |
 
 ```bash
-source /opt/ros/humble/setup.bash
-ros2 --version
+ros2 pkg executables moonwake_camera
 ```
 
-安装 `colcon`、编译依赖和 Launch 运行依赖：
+---
+
+## 话题接口
+
+### 订阅
+
+| 话题 | 类型 | 说明 |
+| --- | --- | --- |
+| `image_raw` | `sensor_msgs/msg/Image` | 原始图像，要求编码 `bgr8` |
+| `camera_info` | `sensor_msgs/msg/CameraInfo` | 与图像做时间同步，并校验分辨率 |
+
+### 发布
+
+| 话题 | 类型 | 说明 |
+| --- | --- | --- |
+| `detection` | `moonwake_camera/msg/DetectionArray` | 每帧的状态与检测结果 |
+| `debug_mask` | `sensor_msgs/msg/Image` | 二值 mask（`mono8`），需 `publish_debug_mask:=true` |
+
+> ⚠️ 检测结果话题是 **`detection`（单数）**，而评估脚本默认订阅 `detections`，需要显式指定。
+
+### `DetectionArray` 字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `header` | `std_msgs/Header` | 继承输入图像的时间戳与坐标系 |
+| `status` | `uint8` | 本帧状态码，见下表 |
+| `detections` | `Detection[]` | 目标列表 |
+| `process_time_ms` | `float32` | 本帧算法耗时 |
+| `data_age_ms` | `float32` | 数据年龄（now − 图像时间戳） |
+
+| 值 | 常量 | 含义 |
+| --- | --- | --- |
+| 0 | `STATUS_DETECTED` | 正常检测到目标 |
+| 1 | `STATUS_NO_DETECTION` | 流程正常但无目标 |
+| 2 | `STATUS_INPUT_ERROR` | 分辨率不匹配 / 图像解码失败 |
+| 3 | `STATUS_INPUT_STALE` | 数据年龄超过 `stale_threshold_sec` |
+| 4 | `STATUS_CONFIG_ERROR` | 参数非法（如 `h_min >= h_max`） |
+
+`Detection` 字段：`class_name`、`center`（像素坐标）、`bbox`（`[x_min, y_min, x_max, y_max]`）、`score`（连通域面积 / 外接框面积）。
+
+---
+
+## 参数
+
+### 检测参数
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `h_min` / `h_max` | `0` / `180` | HSV 色相范围（OpenCV 中 H 为 0~180） |
+| `s_min` / `s_max` | `50` / `255` | 饱和度范围 |
+| `v_min` / `v_max` | `50` / `255` | 明度范围 |
+| `min_area` | `100` | 连通域最小面积（像素），小于则丢弃 |
+| `kernel_size` | `5` | 形态学核边长，`Size(k, k)` 椭圆核 |
+| `stale_threshold_sec` | `0.5` | 数据年龄阈值（秒），超过判为 `INPUT_STALE` |
+| `publish_debug_mask` | `false` | 是否发布 `debug_mask` |
+
+### 异常样本保存参数
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `save_failure_samples` | `true` | 是否保存（仅 `INPUT_STALE` / `NO_DETECTION` / `CONFIG_ERROR` 三类） |
+| `failure_dir` | `""` | 保存目录；**留空 = 自动存到 `<本包>/failure_samples/`** |
+| `failure_min_interval_sec` | `10.0` | 两次落盘的最小间隔，防止写满磁盘 |
+| `failure_max_samples` | `200` | 单次运行最多保存份数，`<=0` 不限 |
+
+运行时可热改：
 
 ```bash
-sudo apt update
-sudo apt install -y \
-  python3-colcon-common-extensions \
-  ros-humble-ament-cmake \
-  ros-humble-rclcpp \
-  ros-humble-std-msgs \
-  ros-humble-std-srvs \
-  ros-humble-ros2launch
+ros2 param set /buoy_detector_node min_area 60
+ros2 param get /buoy_detector_node h_min
 ```
 
-如果尚未初始化 `rosdep`，可以执行：
-
-```bash
-sudo rosdep init
-rosdep update
-```
-
-如果 `rosdep init` 提示配置文件已存在，可以跳过该命令。
-
-## 创建工作区
-
-将两个 Package 放入工作区的 `src/` 目录。下面的示例使用 `~/ros2_ws`：
-
-```bash
-mkdir -p ~/ros2_ws/src
-cp -r /path/to/moonwake_autonomy-main/src/moonwake_ros2_training ~/ros2_ws/src/
-cp -r /path/to/moonwake_autonomy-main/src/moonwake_sensor_status ~/ros2_ws/src/
-cd ~/ros2_ws
-```
-
-请将 `/path/to/moonwake_autonomy-main` 替换为项目的实际路径。
-
-安装工作区中声明的 ROS 依赖：
-
-```bash
-source /opt/ros/humble/setup.bash
-rosdep install --from-paths src --ignore-src -r -y
-```
-
-创建 `moonwake_sensor_status` 的 CMake 安装目录：
-
-```bash
-mkdir -p \
-  ~/ros2_ws/src/moonwake_sensor_status/launch \
-  ~/ros2_ws/src/moonwake_sensor_status/config
-```
-
-这两个目录当前可以为空。
+---
 
 ## 构建
 
-### 一次构建两个 Package
-
-在工作区根目录执行：
-
 ```bash
-cd ~/ros2_ws
+cd ~/moonwake_autonomy
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install \
-  --packages-select moonwake_ros2_training moonwake_sensor_status
+colcon build --packages-select moonwake_camera \
+  --cmake-args -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 source install/setup.bash
 ```
 
-### 只构建训练示例
+`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` 会生成 `build/moonwake_camera/compile_commands.json`，VSCode IntelliSense 靠它自动对齐编译参数。**改完代码要重新构建一次**才会刷新。
+
+---
+
+## 运行
+
+### 一条命令跑完整链路（推荐）
 
 ```bash
-cd ~/ros2_ws
-source /opt/ros/humble/setup.bash
-colcon build --symlink-install \
-  --packages-select moonwake_ros2_training
-source install/setup.bash
+ros2 launch moonwake_camera test_with_video.launch.py \
+  video:=/home/shaofei/videos/test.mp4 rate:=10.0
 ```
 
-### 只构建相机状态示例
+同时启动「视频发布 + 检测 + 评估」，`Ctrl+C` 后自动打印统计报告并保存 CSV。
+
+| launch 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `video` | `''` | 视频路径；留空则跳过发布节点（接真相机时用） |
+| `rate` | `0.0` | 发布帧率，0 = 跟随视频自身 FPS；640×480 建议 `10.0` |
+| `loop` | `true` | 播完是否循环 |
+| `params_file` | 包内 `config/detector_params.yaml` | 参数文件 |
+| `start_evaluator` | `true` | 是否启动评估节点 |
+| `eval_topic` | `/detection` | 评估订阅的话题 |
+| `eval_csv` | `eval_result.csv` | CSV 输出路径（相对执行目录） |
+| `print_interval` | `5.0` | 进度打印间隔（秒），0 关闭 |
+
+### 手动分终端启动
 
 ```bash
-cd ~/ros2_ws
-source /opt/ros/humble/setup.bash
-colcon build --symlink-install \
-  --packages-select moonwake_sensor_status
-source install/setup.bash
+# 终端 1：图像源
+ros2 run moonwake_camera video_publisher.py --ros-args -p video:=/path/test.mp4 -p rate:=10.0
+
+# 终端 2：检测节点
+ros2 run moonwake_camera buoy_detector_node --ros-args \
+  --params-file ~/moonwake_autonomy/src/moonwake_camera/config/detector_params.yaml
 ```
 
-每次打开新终端，都应加载 ROS 2 和工作区环境：
+### 观察结果
 
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
+ros2 topic echo /detection --once
+ros2 run rqt_image_view rqt_image_view /image_raw
+ros2 run rqt_image_view rqt_image_view /debug_mask
 ```
 
-确认可执行文件已安装：
+---
+
+## 测试脚本
+
+### `video_publisher.py` —— 用视频代替相机
+
+按固定帧率发布 `image_raw` + `camera_info`，让检测节点像接真相机一样工作。
 
 ```bash
-ros2 pkg executables moonwake_ros2_training
-ros2 pkg executables moonwake_sensor_status
+ros2 run moonwake_camera video_publisher.py --ros-args \
+  -p video:=/home/shaofei/videos/test.mp4 -p rate:=10.0
 ```
 
-预期可以分别看到 5 个训练节点和 1 个传感器状态节点。
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `video` | `''` | 视频路径（必填） |
+| `rate` | `0.0` | 发布帧率，0 = 跟随视频 FPS |
+| `loop` | `true` | 播完循环 |
+| `frame_id` | `camera` | `header.frame_id` |
+| `qos_depth` | `10` | 发布队列深度 |
 
-## 运行训练 Launch
+> 时间戳用**当前 ROS 时间**，不是视频原始时间；否则 `data_age` 很大，每帧都会被判成 `INPUT_STALE`。
 
-在工作区环境中运行：
+### `evaluate_detector.py` —— 性能评估
+
+订阅检测结果，统计帧数、状态分布、耗时、延迟，逐帧写 CSV，退出时打印报告。
 
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-ros2 launch moonwake_ros2_training training.launch.py
+ros2 run moonwake_camera evaluate_detector.py --ros-args \
+  -p topic:=/detection -p output_csv:=eval_result.csv
 ```
 
-该命令会同时启动：
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `topic` | `detections` | 订阅话题（⚠️ 检测节点是 `/detection`，需显式指定） |
+| `output_csv` | `eval_result.csv` | 输出路径，相对执行目录 |
+| `print_interval` | `5.0` | 进度打印间隔，`<=0` 关闭 |
+| `qos_depth` | `10` | 订阅队列深度 |
 
-- `target_offset_publisher`
-- `steering_hint_node`
+CSV 表头：`Timestamp, Status, Process_Time_ms, Data_Age_ms, Num_Detections`。
+`Timestamp` 取图像 `header.stamp`（秒）；耗时只统计 `process_time_ms > 0` 的帧。
 
-并应用以下 Topic 重映射：
+### `tune_params.py` —— 滑动条调参
 
-- `target_offset` → `/training/target_offset`
-- `steering_hint` → `/training/steering_hint`
-
-Launch 默认读取 `config/training_params.yaml`：
-
-```yaml
-target_offset_publisher:
-  ros__parameters:
-    amplitude: 0.8
-    publish_hz: 1.0
-
-steering_hint_node:
-  ros__parameters:
-    deadband: 0.10
-```
-
-参数含义：
-
-| 参数 | 所属 Node | Launch 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `amplitude` | `target_offset_publisher` | `0.8` | 目标偏移序列的幅值 |
-| `publish_hz` | `target_offset_publisher` | `1.0` | 发布频率，必须大于 0 |
-| `deadband` | `steering_hint_node` | `0.10` | 方向判断死区 |
-
-上表是 `training_params.yaml` 中的值。直接使用 `ros2 run` 且不传入参数时，源码内部默认值为 `amplitude=0.5`、`publish_hz=1.0`、`deadband=0.05`。
-
-在另一个终端查看偏移和转向提示：
+离线读取一张图片，用滑动条实时调整 HSV 阈值、`min_area`、`kernel_size`，处理流程与 C++ 节点完全一致（已验证逐像素相同）。
 
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-ros2 topic echo /training/target_offset --once
+# 指定图片
+python3 ~/moonwake_autonomy/src/moonwake_camera/tools/tune_params.py 图片.png
+
+# 不带参数：自动挑 failure_samples 里最新的原图
+python3 ~/moonwake_autonomy/src/moonwake_camera/tools/tune_params.py
+
+# 无界面批处理，导出 mask
+python3 .../tune_params.py 图片.png --dump out_mask.png -p h_min=34 -p min_area=60
 ```
+
+快捷键：`p` 打印可直接复制的 `ros2 run` 参数，`s` 保存 mask 与预览图，`q` / `ESC` 退出。
+
+---
+
+## 配置文件
+
+`config/detector_params.yaml` 存了一套推荐参数：
 
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-ros2 topic echo /training/steering_hint --once
+ros2 run moonwake_camera buoy_detector_node --ros-args \
+  --params-file ~/moonwake_autonomy/src/moonwake_camera/config/detector_params.yaml
 ```
 
-修改 YAML 参数后，重新构建并重新运行 Launch：
+> YAML 顶层 key 必须与节点名 `buoy_detector_node` 一致，否则参数静默不生效。
 
-```bash
-cd ~/ros2_ws
-source /opt/ros/humble/setup.bash
-colcon build --symlink-install --packages-select moonwake_ros2_training
-source install/setup.bash
-ros2 launch moonwake_ros2_training training.launch.py
-```
+---
 
-按 `Ctrl+C` 可以停止 Launch 及其启动的节点。
+## 失败样本
 
-## 单独运行节点
-
-以下命令可以分别粘贴到不同终端中执行。运行前都要加载环境：
-
-```bash
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-```
-
-### 心跳节点
-
-```bash
-ros2 run moonwake_ros2_training heartbeat_node
-```
-
-预期每秒输出：
+出现 `INPUT_STALE` / `NO_DETECTION` / `CONFIG_ERROR` 时自动保存到 `failure_samples/`，每份三个文件：
 
 ```text
-[INFO] [...] [heartbeat_node]: node is alive
+fail_20261105_170656_758_0001_no_detection.png        # 原图
+fail_20261105_170656_758_0001_no_detection_mask.png   # mask
+fail_20261105_170656_758_0001_no_detection.txt        # 参数 + 状态码 + 诊断信息
 ```
 
-### 消息发布节点
+文件名 = `fail_<时间戳>_<序号>_<状态>`，带序号且不覆盖，默认每 10 秒最多存 1 份。
 
-```bash
-ros2 run moonwake_ros2_training talker_node
-```
+---
 
-该节点每 500 ms 向 `/chatter` 发布：
+## 已知限制
 
-```text
-Hello,ShaoFei.
-```
-
-### 消息订阅节点
-
-```bash
-ros2 run moonwake_ros2_training listener_node
-```
-
-`listener_node` 会订阅 `/chatter` 并保存最新消息，但当前实现不会把消息打印到终端。请先运行 `talker_node`，再使用下面的命令检查消息：
-
-```bash
-ros2 topic echo /chatter --once
-```
-
-### 目标偏移发布节点
-
-使用源码默认参数单独运行：
-
-```bash
-ros2 run moonwake_ros2_training target_offset_publisher
-```
-
-覆盖默认参数：
-
-```bash
-ros2 run moonwake_ros2_training target_offset_publisher --ros-args \
-  -p amplitude:=0.8 \
-  -p publish_hz:=1.0
-```
-
-单独运行时不使用 Launch 的 Topic 重映射，默认 Topic 为 `/target_offset`。
-
-### 转向提示节点
-
-使用源码默认参数单独运行：
-
-```bash
-ros2 run moonwake_ros2_training steering_hint_node
-```
-
-覆盖死区参数：
-
-```bash
-ros2 run moonwake_ros2_training steering_hint_node --ros-args \
-  -p deadband:=0.10
-```
-
-单独运行时使用默认 Topic `/target_offset` 和 `/steering_hint`。请先启动 `target_offset_publisher`，再启动该节点。
-
-## 运行相机状态节点
-
-在已加载工作区环境的终端中执行：
-
-```bash
-ros2 run moonwake_sensor_status sensor_status_node
-```
-
-默认每秒输出：
-
-```text
-[INFO] [...] [front_camera_status]: front camera status: READY
-```
-
-打开详细日志：
-
-```bash
-ros2 service call /set_detailed_log std_srvs/srv/SetBool "{data: true}"
-```
-
-开启后，每秒输出包含模拟 FPS、温度和延迟：
-
-```text
-[DEBUG] front camera status: READY | FPS: 30 , Temp: 45C , Latency:12ms
-```
-
-关闭详细日志：
-
-```bash
-ros2 service call /set_detailed_log std_srvs/srv/SetBool "{data: false}"
-```
-
-该节点只模拟状态，不连接真实相机，也不发布图像。
-
-## 检查运行状态
-
-查看当前运行的所有节点：
-
-```bash
-ros2 node list
-```
-
-运行训练 Launch 后应包含：
-
-```text
-/target_offset_publisher
-/steering_hint_node
-```
-
-运行其他节点后，Node 列表还会出现：
-
-```text
-/heartbeat_node
-/listener_node
-/talker_node
-/front_camera_status
-```
-
-查看训练 Topic：
-
-```bash
-ros2 topic list
-ros2 topic info /training/target_offset
-ros2 topic info /training/steering_hint
-ros2 topic hz /training/target_offset
-```
-
-使用默认配置时，`/training/target_offset` 的发布频率应接近 1 Hz。
-
-查看 `front_camera_status` 提供的 Service：
-
-```bash
-ros2 service list
-ros2 service type /set_detailed_log
-ros2 interface show std_srvs/srv/SetBool
-```
-
-查看 Node 参数：
-
-```bash
-ros2 param list /target_offset_publisher
-ros2 param list /steering_hint_node
-```
-
-`target_offset_publisher` 应提供 `amplitude` 和 `publish_hz`；`steering_hint_node` 应提供 `deadband`。
-
-## 常见问题
-
-### 找不到 `ros2`
-
-当前终端没有加载 ROS 2 环境：
-
-```bash
-source /opt/ros/humble/setup.bash
-```
-
-### 找不到 Package 或可执行文件
-
-先确认工作区已构建，然后重新加载环境：
-
-```bash
-cd ~/ros2_ws
-source /opt/ros/humble/setup.bash
-colcon build --symlink-install \
-  --packages-select moonwake_ros2_training moonwake_sensor_status
-source install/setup.bash
-ros2 pkg executables moonwake_ros2_training
-ros2 pkg executables moonwake_sensor_status
-```
-
-### 构建 `moonwake_sensor_status` 时提示找不到 `launch` 或 `config`
-
-该 Package 的 CMake 会安装这两个目录，但仓库尚未包含空目录。创建后重新构建：
-
-```bash
-mkdir -p \
-  ~/ros2_ws/src/moonwake_sensor_status/launch \
-  ~/ros2_ws/src/moonwake_sensor_status/config
-cd ~/ros2_ws
-source /opt/ros/humble/setup.bash
-colcon build --symlink-install --packages-select moonwake_sensor_status
-source install/setup.bash
-```
-
-### `listener_node` 启动后没有日志
-
-这是当前实现的预期行为。节点会接收消息，但不会打印。使用 `ros2 topic echo /chatter --once` 检查 `talker_node` 是否正在发布。
-
-### 看不到训练 Topic
-
-确认当前使用哪种启动方式：
-
-- `ros2 launch` 使用 `/training/target_offset` 和 `/training/steering_hint`；
-- 单独运行节点使用 `/target_offset` 和 `/steering_hint`。
-
-查看所有 Topic：
-
-```bash
-ros2 topic list
-```
-
-### Service 调用失败
-
-确认 `sensor_status_node` 正在运行，并检查 Service 名称：
-
-```bash
-ros2 node list
-ros2 service list
-```
-
-默认 Service 为 `/set_detailed_log`。
-
-## 当前限制
-
-- 所有状态和消息均为模拟数据，不连接真实硬件；
-- `listener_node` 只保存最新消息，没有终端输出；
-- Sensor Status Package 目前没有自己的 Launch 文件；
-- Sensor Status Package 的 CMake 引用了尚未提交的 `launch/`、`config/` 目录，首次构建前需要手动创建。
+- 尚未接入真实相机驱动。用 `ros2 bag play` 回放时需给检测节点加 `use_sim_time:=true`，否则会被判为数据过期。
+- 检测基于 HSV 阈值 + 连通域，不是深度学习；单区间 `inRange` 对红色这类跨越 H 边界（0 与 180 两侧）的物体会漏检一半。
+- Python 版 `video_publisher.py` 发布 640×480 图像实测上限约 12 FPS，更高帧率需改用 C++ 发布端。
+- `min_area` 是像素面积，依赖分辨率，换分辨率后参数需重新调。
