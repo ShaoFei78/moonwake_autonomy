@@ -6,7 +6,7 @@ build/
 install/
 log/
 failure_samples/
-eval_results.csv
+eval_result.csv
 # ==========================================
 # 2. C++ 编译中间文件与缓存
 # ==========================================
