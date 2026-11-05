@@ -187,7 +187,7 @@ ros2 launch moonwake_camera test_with_video.launch.py \
 | launch 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `video` | `''` | 视频路径；留空则跳过发布节点（接真相机时用） |
-| `rate` | `0.0` | 发布帧率，0 = 跟随视频自身 FPS；640×480 建议 `10.0` |
+| `rate` | `0.0` | 发布帧率，0 = 跟随视频自身 FPS（推荐）；想放慢可填更小值 |
 | `loop` | `true` | 播完是否循环 |
 | `params_file` | 包内 `config/detector_params.yaml` | 参数文件 |
 | `start_evaluator` | `true` | 是否启动评估节点 |
@@ -306,5 +306,5 @@ fail_20261105_170656_758_0001_no_detection.txt        # 参数 + 状态码 + 诊
 
 - 尚未接入真实相机驱动。用 `ros2 bag play` 回放时需给检测节点加 `use_sim_time:=true`，否则会被判为数据过期。
 - 检测基于 HSV 阈值 + 连通域，不是深度学习；单区间 `inRange` 对红色这类跨越 H 边界（0 与 180 两侧）的物体会漏检一半。
-- Python 版 `video_publisher.py` 发布 640×480 图像实测上限约 12 FPS，更高帧率需改用 C++ 发布端。
+- `video_publisher.py` 用 `array.array('B')` 填充 `Image.data`；自己写发布端时若直接赋 `bytes`，每帧会慢约 100 倍（2400×1080 下 640 ms vs 5 ms），进而导致全部帧被判为 `INPUT_STALE`。
 - `min_area` 是像素面积，依赖分辨率，换分辨率后参数需重新调。

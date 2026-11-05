@@ -130,8 +130,8 @@ def generate_launch_description():
             description="视频文件路径；留空则不启动发布节点（接真相机时用）"),
         DeclareLaunchArgument(
             "rate", default_value="0.0",
-            description="发布帧率；0 表示跟随视频自身 FPS。"
-                        "640x480 的 Python 发布端实测上限约 12 Hz，建议填 10.0"),
+            description="发布帧率；0 表示跟随视频自身 FPS（推荐）。"
+                        "想人为放慢就填个更小的值，例如 10.0"),
         DeclareLaunchArgument(
             "loop", default_value="true",
             description="播完是否循环"),

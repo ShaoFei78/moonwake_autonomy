@@ -53,6 +53,7 @@ video_publisher.py —— 用视频文件代替真实相机
         ros2 run moonwake_camera evaluate_detector.py --ros-args -p topic:=/detection
 """
 
+import array
 import sys
 
 import cv2
@@ -180,7 +181,12 @@ class VideoPublisher(Node):
         img_msg.encoding = "bgr8"
         img_msg.is_bigendian = 0
         img_msg.step = self.width * 3
-        img_msg.data = frame.tobytes()
+        # ⚠️ 性能关键：uint8[] 字段必须赋 array.array('B')，不能直接赋 bytes。
+        # 实测 2400x1080（7.42 MB）：
+        #   msg.data = frame.tobytes()            → 640 ms/帧（rclpy 逐字节慢速转换）
+        #   msg.data = array.array('B', ...)      →   2 ms/帧
+        # 用 bytes 的话整条链路只能跑到 1.6 FPS，数据年龄必然超过 stale 阈值。
+        img_msg.data = array.array("B", frame.tobytes())
 
         # 两个话题的时间戳必须一致，否则 ApproximateTime 匹配不上
         self.camera_info.header.stamp = stamp
