@@ -98,11 +98,14 @@ FailureRecorder::FailureRecorder(Options options, rclcpp::Logger logger)
     root_ = absolute_path;
   }
 
-  std::filesystem::create_directories(root_, ec);
-  if (ec) {
-    RCLCPP_ERROR(
-      logger_, "无法创建异常样本目录 '%s': %s",
-      root_.c_str(), ec.message().c_str());
+  // 关掉保存功能时连目录都不建，避免"明明没开却多出一个空文件夹"
+  if (options_.enabled) {
+    std::filesystem::create_directories(root_, ec);
+    if (ec) {
+      RCLCPP_ERROR(
+        logger_, "无法创建异常样本目录 '%s': %s",
+        root_.c_str(), ec.message().c_str());
+    }
   }
 }
 

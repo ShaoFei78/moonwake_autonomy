@@ -66,6 +66,9 @@ from sensor_msgs.msg import CameraInfo, Image
 class VideoPublisher(Node):
     """把视频文件当成一台"帧率固定、时间戳实时"的相机。"""
 
+    # 支持的输出编码 -> 每像素通道数
+    ENCODINGS = {"bgr8": 3, "rgb8": 3, "mono8": 1, "bgra8": 4}
+
     def __init__(self):
         super().__init__("video_publisher")
 
@@ -74,6 +77,8 @@ class VideoPublisher(Node):
         self.declare_parameter("loop", True)
         self.declare_parameter("frame_id", "camera")
         self.declare_parameter("qos_depth", 10)
+        # 发布图像的编码，默认 bgr8（OpenCV 解码出来的原生格式）
+        self.declare_parameter("encoding", "bgr8")
 
         video_path = str(self.get_parameter("video").value)
         if not video_path:
@@ -83,6 +88,13 @@ class VideoPublisher(Node):
         self.loop = bool(self.get_parameter("loop").value)
         self.frame_id = str(self.get_parameter("frame_id").value)
         depth = int(self.get_parameter("qos_depth").value)
+
+        self.encoding = str(self.get_parameter("encoding").value).strip().lower()
+        if self.encoding not in self.ENCODINGS:
+            raise RuntimeError(
+                f"不支持的 encoding: '{self.encoding}'，"
+                f"可选值：{', '.join(sorted(self.ENCODINGS))}")
+        self.channels = self.ENCODINGS[self.encoding]
 
         # ---------- 打开视频 ----------
         self.cap = cv2.VideoCapture(video_path)
@@ -149,6 +161,7 @@ class VideoPublisher(Node):
             f"分辨率 {self.width}x{self.height}，"
             f"总帧数 {total if total > 0 else '未知'}，"
             f"视频 FPS {video_fps:.2f}，按 {self.rate:.2f} FPS 发布，"
+            f"编码 {self.encoding}，"
             f"loop={'on' if self.loop else 'off'}")
 
     # ------------------------------------------------------------
@@ -170,6 +183,9 @@ class VideoPublisher(Node):
                 self.destroy_timer(self.timer)
                 return
 
+        # 按参数把 BGR 帧转成目标编码（bgr8 时原样返回，不做多余拷贝）
+        frame = self._to_encoding(frame)
+
         # 时间戳用「现在」——这是整个脚本最关键的一行
         stamp = self.get_clock().now().to_msg()
 
@@ -178,9 +194,9 @@ class VideoPublisher(Node):
         img_msg.header.frame_id = self.frame_id
         img_msg.height = self.height
         img_msg.width = self.width
-        img_msg.encoding = "bgr8"
+        img_msg.encoding = self.encoding
         img_msg.is_bigendian = 0
-        img_msg.step = self.width * 3
+        img_msg.step = self.width * self.channels
         # ⚠️ 性能关键：uint8[] 字段必须赋 array.array('B')，不能直接赋 bytes。
         # 实测 2400x1080（7.42 MB）：
         #   msg.data = frame.tobytes()            → 640 ms/帧（rclpy 逐字节慢速转换）
@@ -199,6 +215,16 @@ class VideoPublisher(Node):
         # 每 5 秒报一次进度，方便确认确实在发
         if self.frames_sent % max(1, int(self.rate * 5)) == 0:
             self.get_logger().info(f"已发布 {self.frames_sent} 帧")
+
+    def _to_encoding(self, bgr):
+        """把 OpenCV 解码得到的 BGR 帧转成参数指定的编码。"""
+        if self.encoding == "rgb8":
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        if self.encoding == "mono8":
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        if self.encoding == "bgra8":
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+        return bgr  # bgr8：OpenCV 原生格式，不需要转换
 
     def destroy_node(self):
         try:

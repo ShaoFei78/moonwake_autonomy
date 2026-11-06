@@ -78,7 +78,9 @@ def _launch_setup(context):
             executable="video_publisher.py",
             name="video_publisher",
             output="screen",
-            parameters=[{
+            # 先读参数文件（里面的 video_publisher 段提供 encoding），
+            # 再用下面的 dict 覆盖视频路径等由 launch 参数决定的项
+            parameters=[params_file, {
                 "video": os.path.expanduser(video),
                 "rate": rate,
                 "loop": loop,

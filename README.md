@@ -232,10 +232,14 @@ ros2 run moonwake_camera video_publisher.py --ros-args \
 | `video` | `''` | 视频路径（必填） |
 | `rate` | `0.0` | 发布帧率，0 = 跟随视频 FPS |
 | `loop` | `true` | 播完循环 |
+| `encoding` | `bgr8` | 发布图像编码，可选 `bgr8` / `rgb8` / `mono8` / `bgra8` |
 | `frame_id` | `camera` | `header.frame_id` |
 | `qos_depth` | `10` | 发布队列深度 |
 
 > 时间戳用**当前 ROS 时间**，不是视频原始时间；否则 `data_age` 很大，每帧都会被判成 `INPUT_STALE`。
+>
+> `encoding` 也可以在参数文件的 `video_publisher:` 段里配置（launch 会同时把参数文件传给发布节点）。
+> ⚠️ 改成 `mono8` 后图像没有颜色，HSV 阈值检测必然一帧都检不出——它只是用来验证链路，不适合做彩色目标检测。
 
 ### `evaluate_detector.py` —— 性能评估
 
@@ -277,14 +281,31 @@ python3 .../tune_params.py 图片.png --dump out_mask.png -p h_min=34 -p min_are
 
 ## 配置文件
 
-`config/detector_params.yaml` 存了一套推荐参数：
+`config/detector_params.yaml` 一个文件配置两个节点，各读各的段落：
 
-```bash
-ros2 run moonwake_camera buoy_detector_node --ros-args \
-  --params-file ~/moonwake_autonomy/src/moonwake_camera/config/detector_params.yaml
+```yaml
+buoy_detector_node:
+  ros__parameters:
+    h_min: 35
+    ...
+    save_failure_samples: true      # 异常样本总开关
+    failure_min_interval_sec: 10.0  # 两次保存的最小间隔（秒）
+
+video_publisher:
+  ros__parameters:
+    encoding: bgr8                  # bgr8 / rgb8 / mono8 / bgra8
 ```
 
-> YAML 顶层 key 必须与节点名 `buoy_detector_node` 一致，否则参数静默不生效。
+```bash
+# 单独运行检测节点
+ros2 run moonwake_camera buoy_detector_node --ros-args \
+  --params-file ~/moonwake_autonomy/src/moonwake_camera/config/detector_params.yaml
+
+# launch 会把这个文件同时传给检测节点和视频发布节点
+ros2 launch moonwake_camera test_with_video.launch.py video:=/path/test.mp4
+```
+
+> YAML 顶层 key 必须与节点名一致（`buoy_detector_node` / `video_publisher`），否则参数静默不生效。
 
 ---
 

@@ -13,18 +13,18 @@ buoy_detector_node:
   ros__parameters:
     # ── HSV 阈值 ────────────────────────────────────────────
     # H: 0~180（对应 0~360 度）；S/V: 0~255
-    h_min: 34
-    h_max: 84
-    s_min: 42
+    h_min: 35
+    h_max: 85
+    s_min: 75
     s_max: 255
-    v_min: 40
+    v_min: 41
     v_max: 255
 
     # ── 连通域过滤 ──────────────────────────────────────────
     # 面积小于 min_area 的连通域会被丢弃，单位是像素
-    min_area: 60
+    min_area: 100
     # 形态学核大小，getStructuringElement(MORPH_ELLIPSE, Size(k,k))
-    kernel_size: 5
+    kernel_size: 8
 
     # ── 时序 ────────────────────────────────────────────────
     # 数据年龄超过这个值判为 STATUS_INPUT_STALE（秒）
@@ -36,11 +36,26 @@ buoy_detector_node:
     publish_debug_mask: true
 
     # ── 异常样本保存 ────────────────────────────────────────
+    # 总开关：false 时完全不保存（连目录都不会创建）
     save_failure_samples: true
     # 留空 = 自动存到 <本包目录>/failure_samples/
     # 想换个地方就写绝对路径，例如 /home/shaofei/data/samples
     failure_dir: ""
     # 两次落盘的最小间隔（秒），防止连续失败把磁盘写满
+    # 0 表示不限速（每次失败都存）；想更省就调大，比如 30
     failure_min_interval_sec: 10.0
     # 单次运行最多保存多少份，<=0 表示不限制
     failure_max_samples: 200
+
+
+# ──────────────────────────────────────────────────────────────
+# 用视频代替相机时，video_publisher 节点的参数
+# 这个文件会同时传给检测节点和视频发布节点，各读各的段落
+# ──────────────────────────────────────────────────────────────
+video_publisher:
+  ros__parameters:
+    # 发布图像的编码，默认 bgr8（OpenCV 解码出来的原生格式）
+    # 可选：bgr8 / rgb8 / mono8 / bgra8
+    # 改成 mono8 可以模拟灰度相机；检测节点内部会统一转成 bgr8 处理
+    encoding: bgr8
+
