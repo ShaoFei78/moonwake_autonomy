@@ -140,14 +140,14 @@ ros2 pkg executables moonwake_camera
 | `min_area` | `100` | 连通域最小面积（像素），小于则丢弃 |
 | `kernel_size` | `5` | 形态学核边长，`Size(k, k)` 椭圆核 |
 | `stale_threshold_sec` | `0.5` | 数据年龄阈值（秒），超过判为 `INPUT_STALE` |
-| `publish_debug_mask` | `false` | 是否发布 `debug_mask`（二值 mask） |
+| `publish_debug_mask` | `true` | 是否发布 `debug_mask`（二值 mask） |
 | `publish_debug_image` | `true` | 是否发布 `debug`（检测框标注图） |
 
 ### 异常样本保存参数
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `save_failure_samples` | `true` | 是否保存（仅 `INPUT_STALE` / `NO_DETECTION` / `CONFIG_ERROR` 三类） |
+| `save_failure_samples` | `false` | 是否保存（仅 `INPUT_STALE` / `NO_DETECTION` / `CONFIG_ERROR` 三类） |
 | `failure_dir` | `""` | 保存目录；**留空 = 自动存到 `<本包>/failure_samples/`** |
 | `failure_min_interval_sec` | `10.0` | 两次落盘的最小间隔，防止写满磁盘 |
 | `failure_max_samples` | `200` | 单次运行最多保存份数，`<=0` 不限 |
