@@ -59,16 +59,20 @@ class BuoyDetectorNode : public rclcpp::Node
         BuoyDetectorNode() : Node("buoy_detector_node")
         {
           //声明参数
-          this->declare_parameter<int>("h_min", 0);
-          this->declare_parameter<int>("h_max", 180);
-          this->declare_parameter<int>("s_min", 50);
+          this->declare_parameter<int>("h_min", 35);
+          this->declare_parameter<int>("h_max", 85);
+          this->declare_parameter<int>("s_min", 75);
           this->declare_parameter<int>("s_max", 255);
-          this->declare_parameter<int>("v_min", 50);
+          this->declare_parameter<int>("v_min", 41);
           this->declare_parameter<int>("v_max", 255);
           this->declare_parameter<int>("min_area", 100);
-          this->declare_parameter<int>("kernel_size", 5);
+          this->declare_parameter<int>("kernel_size", 8);
           this->declare_parameter<double>("stale_threshold_sec", 0.5);
           this->declare_parameter<bool>("publish_debug_mask", false);
+          //标注图开关：把检测框画在原图上，发布到 debug 话题（默认开启）
+          this->declare_parameter<bool>("publish_debug_image", true);
+          this->declare_parameter<int>("adaptive_block_size",11);
+          this->declare_parameter<double>("adaptive_C",2.0);
           //异常样本保存相关参数
           this->declare_parameter<bool>("save_failure_samples", true);
           //留空 = 自动存到 <本包目录>/failure_samples/（见 default_failure_dir）
@@ -79,6 +83,8 @@ class BuoyDetectorNode : public rclcpp::Node
           //创建发布者
           result_pub_=this->create_publisher<DetectionArray>("detection",10);
           debug_pub_=this->create_publisher<sensor_msgs::msg::Image>("debug_mask",10);
+          //标注图：检测框画在原图上，方便直接用 rqt_image_view 看效果
+          debug_image_pub_=this->create_publisher<sensor_msgs::msg::Image>("debug",10);
           //创建订阅者
           image_sub_.subscribe(this,"image_raw");
           info_sub_.subscribe(this,"camera_info");
@@ -99,10 +105,56 @@ class BuoyDetectorNode : public rclcpp::Node
                       failure_recorder_->root().c_str(),
                       rec_opt.enabled?"enabled":"disabled",
                       rec_opt.min_interval_sec,rec_opt.max_samples);
+          //启动时打印自适应阈值参数
+
+          //启动时打印自适应阈值参数
+          //as_int() 返回的是 int64_t，直接塞进 %d 类型不匹配（会有 -Wformat 警告），
+          //所以先存成 int 再打印（block_size 本来就只有几十，不会溢出）
+          int block_size=this->get_parameter("adaptive_block_size").as_int();
+          double adaptive_c=this->get_parameter("adaptive_C").as_double();
+          RCLCPP_INFO(this->get_logger(),"adaptive params: block_size=%d, C=%.1f",
+                      block_size,adaptive_c);
+          //打印启动信息
           RCLCPP_INFO(this->get_logger(),"BuoyDetectorNode started with synchronized input.");
           
         }
     private:
+        //把检测框画到一张图上。只负责画，不参与任何检测计算。
+        //注意：调用方必须传一张可以随便改的图（clone 过的），不要直接画在 cv_img 上。
+        void draw_detections(cv::Mat &canvas,const std::vector<Detection> &detections)
+        {
+            for(const auto &det : detections){
+                //bbox 是 [x_min, y_min, x_max, y_max]，全是 float
+                const int x1=static_cast<int>(det.bbox[0]);
+                const int y1=static_cast<int>(det.bbox[1]);
+                const int x2=static_cast<int>(det.bbox[2]);
+                const int y2=static_cast<int>(det.bbox[3]);
+
+                //绿框
+                cv::rectangle(canvas,cv::Point(x1,y1),cv::Point(x2,y2),
+                    cv::Scalar(0,255,0),2);
+                //中心点（红点）
+                cv::circle(canvas,
+                    cv::Point(static_cast<int>(det.center.x),static_cast<int>(det.center.y)),
+                    3,cv::Scalar(0,0,255),-1);
+
+                //左上角贴个标签：类别 + 分数
+                const std::string label=det.class_name+" "+format_double(det.score,2);
+                int baseline=0;
+                const cv::Size text_size=cv::getTextSize(label,cv::FONT_HERSHEY_SIMPLEX,
+                    0.5,1,&baseline);
+                //小文本画面可能贴到图外，做一下边界保护
+                const int tx=std::max(0,x1);
+                const int ty=std::max(text_size.height+2,y1);
+                cv::rectangle(canvas,
+                    cv::Point(tx,ty-text_size.height-2),
+                    cv::Point(tx+text_size.width+2,ty+baseline-2),
+                    cv::Scalar(0,255,0),-1);
+                cv::putText(canvas,label,cv::Point(tx+1,ty-1),
+                    cv::FONT_HERSHEY_SIMPLEX,0.5,cv::Scalar(0,0,0),1,cv::LINE_AA);
+            }
+        }
+
         void sync_callback(const sensor_msgs::msg::Image::ConstSharedPtr img_msg,const sensor_msgs::msg::CameraInfo::ConstSharedPtr info_msg)
         {
             auto start_time =this->now();
@@ -180,20 +232,33 @@ class BuoyDetectorNode : public rclcpp::Node
             //
             //OpenCV处理
             cv::Mat hsv,mask;
+            //apply_adaptive_threshold(cv_img,mask);
+            //第一重过滤：全局阈值
             cv::cvtColor(cv_img,hsv,cv::COLOR_BGR2HSV);
-            //
+            cv::Mat color_mask;
             cv::Scalar lower(h_min,s_min,v_min);
             cv::Scalar upper(h_max,s_max,v_max);
-            cv::inRange(hsv,lower,upper,mask);
-            //
+            cv::inRange(hsv,lower,upper,color_mask);
+            //第二重：自适应过滤;
+            cv::Mat adaptive_mask;
+            int block_size =this->get_parameter("adaptive_block_size").as_int();
+            double adaptive_C=this->get_parameter("adaptive_C").as_double();
+            if (block_size %2==0)
+            {
+                block_size+=1;
+
+            }
+            cv::adaptiveThreshold(color_mask,adaptive_mask,255,cv::ADAPTIVE_THRESH_GAUSSIAN_C,cv::THRESH_BINARY,block_size,adaptive_C);
+            cv::bitwise_and(color_mask,adaptive_mask,mask);
+            //形态学操作：先开运算去噪，再闭运算填洞
             cv::Mat kernel=cv::getStructuringElement(cv::MORPH_ELLIPSE,
             cv::Size(kernel_size,kernel_size));
             cv::morphologyEx(mask,mask,cv::MORPH_OPEN,kernel);
             cv::morphologyEx(mask,mask,cv::MORPH_CLOSE,kernel);
-            //
+            //连通域分析
             cv::Mat labels,stats,centroids;
             int n_labels=cv::connectedComponentsWithStats(mask,labels,stats,centroids);
-            //
+            //筛选候选
             std::vector<Detection> candidates;
             for(int i=1;i<n_labels;++i){
                 int area=stats.at<int>(i,cv::CC_STAT_AREA);
@@ -243,6 +308,17 @@ class BuoyDetectorNode : public rclcpp::Node
                     debug_pub_->publish(*debug_msg);
                 
             }
+            //标注图发布：把检测框画在原图上，发到 debug 话题
+            //必须先 clone：cv_img 是 toCvShare 出来的，和 img_msg 共享同一块内存，
+            //直接往上画会把原始图像数据改坏
+            if (this->get_parameter("publish_debug_image").as_bool())
+            {
+                cv::Mat annotated=cv_img.clone();
+                draw_detections(annotated,candidates);
+                auto annotated_msg=cv_bridge::CvImage(
+                    img_msg->header,"bgr8",annotated).toImageMsg();
+                debug_image_pub_->publish(*annotated_msg);
+            }
             
             
         }
@@ -253,9 +329,12 @@ class BuoyDetectorNode : public rclcpp::Node
         std::vector<std::pair<std::string,std::string>> snapshot_params()
         {
             std::vector<std::pair<std::string,std::string>> kv;
+            //只能写「已经 declare_parameter 过的」参数名：
+            //列表里出现未声明参数时，下面这行 get_parameter 会抛异常，保存样本时直接崩
             for (const char * name : {"h_min","h_max","s_min","s_max","v_min","v_max",
                                       "min_area","kernel_size","stale_threshold_sec",
-                                      "publish_debug_mask"}) {
+                                      "adaptive_block_size","adaptive_C",
+                                      "publish_debug_mask","publish_debug_image"}) {
                 kv.emplace_back(name,this->get_parameter(name).value_to_string());
             }
             return kv;
@@ -349,6 +428,7 @@ class BuoyDetectorNode : public rclcpp::Node
         std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
         rclcpp::Publisher<DetectionArray>::SharedPtr result_pub_;
         rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_pub_;
+        rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_image_pub_;
         std::unique_ptr<moonwake_camera::FailureRecorder> failure_recorder_;
         
 

@@ -102,6 +102,7 @@ ros2 pkg executables moonwake_camera
 | --- | --- | --- |
 | `detection` | `moonwake_camera/msg/DetectionArray` | 每帧的状态与检测结果 |
 | `debug_mask` | `sensor_msgs/msg/Image` | 二值 mask（`mono8`），需 `publish_debug_mask:=true` |
+| `debug` | `sensor_msgs/msg/Image` | 检测框标注图（`bgr8`），需 `publish_debug_image:=true`（默认开） |
 
 > ⚠️ 检测结果话题是 **`detection`（单数）**，而评估脚本默认订阅 `detections`，需要显式指定。
 
@@ -139,7 +140,8 @@ ros2 pkg executables moonwake_camera
 | `min_area` | `100` | 连通域最小面积（像素），小于则丢弃 |
 | `kernel_size` | `5` | 形态学核边长，`Size(k, k)` 椭圆核 |
 | `stale_threshold_sec` | `0.5` | 数据年龄阈值（秒），超过判为 `INPUT_STALE` |
-| `publish_debug_mask` | `false` | 是否发布 `debug_mask` |
+| `publish_debug_mask` | `false` | 是否发布 `debug_mask`（二值 mask） |
+| `publish_debug_image` | `true` | 是否发布 `debug`（检测框标注图） |
 
 ### 异常样本保存参数
 
@@ -179,7 +181,7 @@ source install/setup.bash
 
 ```bash
 ros2 launch moonwake_camera test_with_video.launch.py \
-  video:=/home/shaofei/videos/test.mp4 rate:=10.0
+  video:=/home/shaofei/Videos/test.mp4 rate:=10.0
 ```
 
 同时启动「视频发布 + 检测 + 评估」，`Ctrl+C` 后自动打印统计报告并保存 CSV。
@@ -210,8 +212,9 @@ ros2 run moonwake_camera buoy_detector_node --ros-args \
 
 ```bash
 ros2 topic echo /detection --once
-ros2 run rqt_image_view rqt_image_view /image_raw
-ros2 run rqt_image_view rqt_image_view /debug_mask
+ros2 run rqt_image_view rqt_image_view /image_raw     # 原始画面
+ros2 run rqt_image_view rqt_image_view /debug         # 检测框标注图（最常用）
+ros2 run rqt_image_view rqt_image_view /debug_mask    # 二值 mask
 ```
 
 ---

@@ -11,13 +11,16 @@
 
 buoy_detector_node:
   ros__parameters:
+   
+    adaptive_block_size: 11
+    adaptive_C: 1.5
     # ── HSV 阈值 ────────────────────────────────────────────
     # H: 0~180（对应 0~360 度）；S/V: 0~255
-    h_min: 35
-    h_max: 85
-    s_min: 75
+    h_min: 45
+    h_max: 75
+    s_min: 95
     s_max: 255
-    v_min: 41
+    v_min: 85
     v_max: 255
 
     # ── 连通域过滤 ──────────────────────────────────────────
@@ -34,10 +37,13 @@ buoy_detector_node:
     # ── 调试 ────────────────────────────────────────────────
     # 把处理后的 mask 发布到 debug_mask 话题，调参阶段建议开
     publish_debug_mask: true
+    # 把检测框画在原图上，发布到 debug 话题（rqt_image_view /debug 直接看）
+    # 默认开启；每帧多约 5~6 ms（2400x1080），追求极限帧率时再关
+    publish_debug_image: true
 
     # ── 异常样本保存 ────────────────────────────────────────
     # 总开关：false 时完全不保存（连目录都不会创建）
-    save_failure_samples: true
+    save_failure_samples: false
     # 留空 = 自动存到 <本包目录>/failure_samples/
     # 想换个地方就写绝对路径，例如 /home/shaofei/data/samples
     failure_dir: ""
