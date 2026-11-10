@@ -11,7 +11,25 @@
 
 buoy_detector_node:
   ros__parameters:
-   
+    # ── 检测后端 ────────────────────────────────────────────
+    # hsv  = 原来的 OpenCV 颜色阈值 + 自适应阈值 + 连通域方案
+    # yolo = ONNX Runtime 推理（需要模型文件，且编译时找到 ONNX Runtime）
+    detector_backend: hsv
+
+    # yolo 后端专用参数（detector_backend: hsv 时全部忽略）
+    model_path: "/home/shaofei/perception_release_v1/model.onnx"
+    # 置信度阈值（模型契约默认 0.25）
+    model_conf_threshold: 0.25
+    # NMS 的 IoU 阈值（模型契约默认 0.7）
+    model_iou_threshold: 0.7
+    # 模型输入边长，必须和模型实际输入一致（当前 640）
+    model_input_size: 640
+    # 推理线程数：0 = 交给 ONNX Runtime 决定
+    # 这台机器实测：默认 141 ms/帧，限制到 4 线程 102 ms/帧（核多时反而更慢）
+    model_num_threads: 0
+    # 类别名，多个用逗号分隔；单类模型就是 green_buoy
+    model_class_names: "green_buoy"
+
     adaptive_block_size: 11
     adaptive_C: 1.5
     # ── HSV 阈值 ────────────────────────────────────────────

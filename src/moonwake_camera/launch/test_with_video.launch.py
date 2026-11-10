@@ -66,6 +66,10 @@ def _launch_setup(context):
     eval_csv = os.path.expanduser(
         LaunchConfiguration("eval_csv").perform(context).strip())
     print_interval = float(LaunchConfiguration("print_interval").perform(context))
+    # 空字符串 = 沿用参数文件里的值；非空 = 覆盖
+    backend_override = LaunchConfiguration("detector_backend").perform(context).strip()
+    model_path_override = os.path.expanduser(
+        LaunchConfiguration("model_path").perform(context).strip())
 
     actions = []
 
@@ -95,12 +99,22 @@ def _launch_setup(context):
     # 参数文件路径会原样传给节点；路径不对时 launch_ros 会直接报错，不会静默用默认值
     if not os.path.isfile(params_file):
         raise RuntimeError(f"找不到参数文件：{params_file}")
+    detector_parameters = [params_file]
+    overrides = {}
+    if backend_override:
+        overrides["detector_backend"] = backend_override
+    if model_path_override:
+        overrides["model_path"] = model_path_override
+    if overrides:
+        # 放在参数文件之后，同名的会覆盖文件里的值
+        detector_parameters.append(overrides)
+
     actions.append(Node(
         package="moonwake_camera",
         executable="buoy_detector_node",
         name="buoy_detector_node",      # 必须和 yaml 顶层的 key 一致
         output="screen",
-        parameters=[params_file],
+        parameters=detector_parameters,
     ))
 
     # ---------- 3. 评估 ----------
@@ -140,6 +154,12 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "params_file", default_value=default_params,
             description="检测节点的参数文件"),
+        DeclareLaunchArgument(
+            "detector_backend", default_value="",
+            description="覆盖检测后端：hsv / yolo；留空则用参数文件里的值"),
+        DeclareLaunchArgument(
+            "model_path", default_value="",
+            description="覆盖 ONNX 模型路径；留空则用参数文件里的值"),
         DeclareLaunchArgument(
             "start_evaluator", default_value="true",
             description="是否启动评估节点"),

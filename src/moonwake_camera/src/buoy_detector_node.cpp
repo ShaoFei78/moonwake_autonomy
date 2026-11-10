@@ -1,6 +1,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "moonwake_camera/msg/detection_array.hpp"
+#include "moonwake_camera/detector.hpp"
 #include "moonwake_camera/failure_recorder.hpp"
 #include "cv_bridge/cv_bridge.h"
 #include <opencv2/opencv.hpp>
@@ -80,6 +81,17 @@ class BuoyDetectorNode : public rclcpp::Node
           this->declare_parameter<std::string>("failure_dir", "");
           this->declare_parameter<double>("failure_min_interval_sec", 10.0);
           this->declare_parameter<int>("failure_max_samples", 200);
+          //检测后端选择：hsv（原来的 OpenCV 方案）或 yolo（ONNX Runtime）
+          this->declare_parameter<std::string>("detector_backend","hsv");
+          //yolo 后端专用参数
+          this->declare_parameter<std::string>("model_path","");
+          this->declare_parameter<double>("model_conf_threshold",0.25);
+          this->declare_parameter<double>("model_iou_threshold",0.7);
+          this->declare_parameter<int>("model_input_size",640);
+          //推理线程数：0=交给 ONNX Runtime 自己决定；实测 4 线程往往比默认更快
+          this->declare_parameter<int>("model_num_threads",0);
+          //类别名，多个用逗号分隔；单类模型就是 "green_buoy"
+          this->declare_parameter<std::string>("model_class_names","green_buoy");
           //创建发布者
           result_pub_=this->create_publisher<DetectionArray>("detection",10);
           debug_pub_=this->create_publisher<sensor_msgs::msg::Image>("debug_mask",10);
@@ -106,14 +118,15 @@ class BuoyDetectorNode : public rclcpp::Node
                       rec_opt.enabled?"enabled":"disabled",
                       rec_opt.min_interval_sec,rec_opt.max_samples);
           //启动时打印自适应阈值参数
-
-          //启动时打印自适应阈值参数
           //as_int() 返回的是 int64_t，直接塞进 %d 类型不匹配（会有 -Wformat 警告），
           //所以先存成 int 再打印（block_size 本来就只有几十，不会溢出）
           int block_size=this->get_parameter("adaptive_block_size").as_int();
           double adaptive_c=this->get_parameter("adaptive_C").as_double();
           RCLCPP_INFO(this->get_logger(),"adaptive params: block_size=%d, C=%.1f",
                       block_size,adaptive_c);
+          //创建检测后端（hsv / yolo），之后的检测一律走 detector_->detect()
+          detector_=moonwake_camera::create_detector(*this);
+          RCLCPP_INFO(this->get_logger(),"detector backend: %s",detector_->name());
           //打印启动信息
           RCLCPP_INFO(this->get_logger(),"BuoyDetectorNode started with synchronized input.");
           
@@ -203,87 +216,28 @@ class BuoyDetectorNode : public rclcpp::Node
                 result_pub_->publish(output);
                 return;
             }
-            //检查配置有效性
-            int h_min=this->get_parameter("h_min").as_int();
-            int h_max=this->get_parameter("h_max").as_int();
-            int s_min=this->get_parameter("s_min").as_int();
-            int s_max=this->get_parameter("s_max").as_int();
-            int v_min=this->get_parameter("v_min").as_int();
-            int v_max=this->get_parameter("v_max").as_int();
-            int min_area=this->get_parameter("min_area").as_int();
-            int kernel_size=this->get_parameter("kernel_size").as_int();
-            if (h_min>=h_max||s_min>=s_max||v_min>=v_max||min_area<=0||kernel_size<=0)
-            {
-              //把到底哪一项不合法写清楚，方便事后看 txt 定位
-              std::string why;
-              if (h_min>=h_max) why+="h_min>=h_max; ";
-              if (s_min>=s_max) why+="s_min>=s_max; ";
-              if (v_min>=v_max) why+="v_min>=v_max; ";
-              if (min_area<=0) why+="min_area<=0; ";
-              if (kernel_size<=0) why+="kernel_size<=0; ";
-              if (why.size()>=2) why.erase(why.size()-2);  //去掉结尾多出来的 "; "
-              output.status=DetectionArray::STATUS_CONFIG_ERROR;
-              output.process_time_ms=0.0;
-              result_pub_->publish(output);
-              RCLCPP_WARN(this->get_logger(),"CONFIG_ERROR:invalid parameters");
-              save_config_error_sample(cv_img,img_msg,output,why);
-              return;
-            }
-            //
-            //OpenCV处理
-            cv::Mat hsv,mask;
-            //apply_adaptive_threshold(cv_img,mask);
-            //第一重过滤：全局阈值
-            cv::cvtColor(cv_img,hsv,cv::COLOR_BGR2HSV);
-            cv::Mat color_mask;
-            cv::Scalar lower(h_min,s_min,v_min);
-            cv::Scalar upper(h_max,s_max,v_max);
-            cv::inRange(hsv,lower,upper,color_mask);
-            //第二重：自适应过滤;
-            cv::Mat adaptive_mask;
-            int block_size =this->get_parameter("adaptive_block_size").as_int();
-            double adaptive_C=this->get_parameter("adaptive_C").as_double();
-            if (block_size %2==0)
-            {
-                block_size+=1;
-
-            }
-            cv::adaptiveThreshold(color_mask,adaptive_mask,255,cv::ADAPTIVE_THRESH_GAUSSIAN_C,cv::THRESH_BINARY,block_size,adaptive_C);
-            cv::bitwise_and(color_mask,adaptive_mask,mask);
-            //形态学操作：先开运算去噪，再闭运算填洞
-            cv::Mat kernel=cv::getStructuringElement(cv::MORPH_ELLIPSE,
-            cv::Size(kernel_size,kernel_size));
-            cv::morphologyEx(mask,mask,cv::MORPH_OPEN,kernel);
-            cv::morphologyEx(mask,mask,cv::MORPH_CLOSE,kernel);
-            //连通域分析
-            cv::Mat labels,stats,centroids;
-            int n_labels=cv::connectedComponentsWithStats(mask,labels,stats,centroids);
-            //筛选候选
+            //------------ 调用检测后端（hsv / yolo）------------
+            //后端内部负责参数校验和推理；出错时抛异常，节点据此填状态码。
+            //后端返回的 Detection 都是原图像素坐标，后半段不需要知道用的是哪种后端。
             std::vector<Detection> candidates;
-            for(int i=1;i<n_labels;++i){
-                int area=stats.at<int>(i,cv::CC_STAT_AREA);
-                if(area<min_area)continue;
-                Detection det;
-                det.class_name="buoy";
-                det.center.x=centroids.at<double>(i,0);
-                det.center.y=centroids.at<double>(i,1);
-                det.center.z=0.0;
-                int x =stats.at<int>(i,cv::CC_STAT_LEFT);
-                int y =stats.at<int>(i,cv::CC_STAT_TOP);
-                int w =stats.at<int>(i,cv::CC_STAT_WIDTH);
-                int h =stats.at<int>(i,cv::CC_STAT_HEIGHT);
-                det.bbox={
-                    static_cast<float>(x),
-                    static_cast<float>(y),
-                    static_cast<float>(w+x),
-                    static_cast<float>(h+y)
-
-                };
-                //
-                float bbox_area =static_cast<float>(w*h);
-                det.score=(bbox_area>0)?static_cast<float>(area)/bbox_area:0.0f;
-                candidates.push_back(det);
-
+            try{
+                candidates=detector_->detect(cv_img);
+            }
+            catch(const moonwake_camera::DetectorConfigError & e){
+                output.status=DetectionArray::STATUS_CONFIG_ERROR;
+                output.process_time_ms=0.0;
+                result_pub_->publish(output);
+                RCLCPP_WARN(this->get_logger(),"CONFIG_ERROR: %s",e.what());
+                save_config_error_sample(cv_img,img_msg,output,e.what());
+                return;
+            }
+            catch(const moonwake_camera::DetectorModelError & e){
+                //模型加载失败 / forward 抛异常：不能伪装成 NO_DETECTION
+                output.status=DetectionArray::STATUS_MODEL_ERROR;
+                output.process_time_ms=0.0;
+                result_pub_->publish(output);
+                RCLCPP_ERROR(this->get_logger(),"MODEL_ERROR: %s",e.what());
+                return;
             }
             //计算耗时
             auto end_time=this->now();
@@ -295,13 +249,15 @@ class BuoyDetectorNode : public rclcpp::Node
                 output.detections=candidates;
             }
             result_pub_->publish(output);
-            //没检测到目标时存一份样本：此时 mask 是真实的，最适合拿来调阈值
+            //没检测到目标时存一份样本：此时 mask（如果后端有）是真实的，最适合拿来调阈值
             if(output.status==DetectionArray::STATUS_NO_DETECTION){
-                save_no_detection_sample(cv_img,mask,img_msg,output,n_labels-1,min_area);
+                save_no_detection_sample(cv_img,detector_->debug_mask(),img_msg,output,
+                                         detector_->last_reason());
             }
-            //调试图发布
+            //调试图发布（只有 HSV 后端有 mask；YOLO 后端 debug_mask() 返回空）
             bool pub_debug=this->get_parameter("publish_debug_mask").as_bool();
-            if (pub_debug)  
+            cv::Mat mask=detector_->debug_mask();
+            if (pub_debug && !mask.empty())  
             {
                 auto debug_msg=cv_bridge::CvImage(
                     img_msg->header,"mono8",mask).toImageMsg();
@@ -331,9 +287,11 @@ class BuoyDetectorNode : public rclcpp::Node
             std::vector<std::pair<std::string,std::string>> kv;
             //只能写「已经 declare_parameter 过的」参数名：
             //列表里出现未声明参数时，下面这行 get_parameter 会抛异常，保存样本时直接崩
-            for (const char * name : {"h_min","h_max","s_min","s_max","v_min","v_max",
+            for (const char * name : {"detector_backend","h_min","h_max","s_min","s_max","v_min","v_max",
                                       "min_area","kernel_size","stale_threshold_sec",
                                       "adaptive_block_size","adaptive_C",
+                                      "model_path","model_conf_threshold","model_iou_threshold",
+                                      "model_input_size","model_num_threads","model_class_names",
                                       "publish_debug_mask","publish_debug_image"}) {
                 kv.emplace_back(name,this->get_parameter(name).value_to_string());
             }
@@ -406,18 +364,19 @@ class BuoyDetectorNode : public rclcpp::Node
         //STATUS_NO_DETECTION：整条 OpenCV 链路跑完了，mask 是真实结果
         void save_no_detection_sample(const cv::Mat & img,const cv::Mat & mask,
                                       const sensor_msgs::msg::Image::ConstSharedPtr & img_msg,
-                                      const DetectionArray & output,int components,int min_area)
+                                      const DetectionArray & output,const std::string & reason)
         {
             if(!failure_recorder_->should_record()) return;
 
-            FailureSample s=make_sample(output,"STATUS_NO_DETECTION","opencv_pipeline",
-                "mask 里有 "+std::to_string(components)+" 个连通域，但每个面积都 < min_area="+
-                std::to_string(min_area),
+            FailureSample s=make_sample(output,"STATUS_NO_DETECTION","detector_pipeline",
+                reason,
                 img_msg->header.stamp);
-            s.mask_source="pipeline: inRange + 形态学的真实输出";
+            //YOLO 后端不产生 mask，记录器会写一张同尺寸全黑图占位
+            s.mask_source=mask.empty()
+                ? "placeholder: 当前后端不产生 mask，写入同尺寸全黑图"
+                : "pipeline: HSV 颜色阈值 + 自适应阈值 + 形态学的真实输出";
             s.diagnostics={
-                {"components_total",std::to_string(components)},
-                {"components_passed_min_area","0"},
+                {"backend",detector_->name()},
                 {"params_applied","yes"}
             };
             failure_recorder_->record(img,mask,s);
@@ -430,6 +389,8 @@ class BuoyDetectorNode : public rclcpp::Node
         rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_pub_;
         rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debug_image_pub_;
         std::unique_ptr<moonwake_camera::FailureRecorder> failure_recorder_;
+        //检测后端（hsv / yolo），由 detector_backend 参数决定
+        std::unique_ptr<moonwake_camera::IDetector> detector_;
         
 
 };

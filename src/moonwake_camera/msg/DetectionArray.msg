@@ -6,6 +6,8 @@ uint8 STATUS_NO_DETECTION=1
 uint8 STATUS_INPUT_ERROR=2
 uint8 STATUS_INPUT_STALE=3
 uint8 STATUS_CONFIG_ERROR =4
+#模型加载失败 / 推理(forward)抛异常：不得伪装成 NO_DETECTION
+uint8 STATUS_MODEL_ERROR=5
 #本帧处理状态
 uint8 status 
 #检测到的目标列表
