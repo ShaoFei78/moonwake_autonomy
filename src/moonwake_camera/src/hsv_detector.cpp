@@ -76,7 +76,10 @@ std::vector<IDetector::Detection> HsvDetector::detect(const cv::Mat & bgr)
     if (area < min_area) {continue;}
 
     Detection det;
-    det.class_name = "buoy";
+     // 类别名统一约定为 "green_buoy"：
+    // 必须与数据集 classes.txt、YOLO 后端的 model_class_names 保持一致，
+    // 否则下游按 class_name 过滤时，两种后端的结果会对不上。
+    det.class_name = "green_buoy";
     det.center.x = centroids.at<double>(i, 0);
     det.center.y = centroids.at<double>(i, 1);
     det.center.z = 0.0;
