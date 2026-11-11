@@ -34,9 +34,12 @@ test_with_video.launch.py —— 一句命令跑完整条验证链路
 
 import os
 
+import yaml
+
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument, ExecuteProcess, LogInfo, OpaqueFunction)
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -46,6 +49,18 @@ TRUE_SET = {"1", "true", "yes", "on"}
 
 def _as_bool(text: str) -> bool:
     return text.strip().lower() in TRUE_SET
+
+
+def _read_publish_debug_image(params_file: str) -> bool:
+    """从参数文件里读出 publish_debug_image，读不到就当作 False。"""
+    try:
+        with open(params_file, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        params = data.get("buoy_detector_node", {}).get("ros__parameters", {})
+        return bool(params.get("publish_debug_image", False))
+    except Exception as exc:      # 文件读不了/格式错，都不该让 launch 挂掉
+        print(f"[launch] 读取 {params_file} 失败，跳过 debug 图像窗口: {exc}")
+        return False
 
 
 def _launch_setup(context):
@@ -66,6 +81,7 @@ def _launch_setup(context):
     eval_csv = os.path.expanduser(
         LaunchConfiguration("eval_csv").perform(context).strip())
     print_interval = float(LaunchConfiguration("print_interval").perform(context))
+    show_debug = LaunchConfiguration("show_debug_image").perform(context).strip().lower()
     # 空字符串 = 沿用参数文件里的值；非空 = 覆盖
     backend_override = LaunchConfiguration("detector_backend").perform(context).strip()
     model_path_override = os.path.expanduser(
@@ -131,6 +147,24 @@ def _launch_setup(context):
             }],
         ))
 
+    # ---------- 4. debug 图像窗口 ----------
+    # show_debug_image 默认 auto：直接跟随参数文件里的 publish_debug_image，
+    # 节点开标注图就顺手把窗口打开，省得再开一个终端
+    if show_debug == "auto":
+        show_window = _read_publish_debug_image(params_file)
+    else:
+        show_window = _as_bool(show_debug)
+
+    if show_window:
+        if os.environ.get("DISPLAY"):
+            actions.append(ExecuteProcess(
+                cmd=["ros2", "run", "rqt_image_view", "rqt_image_view", "/debug"],
+                output="screen",
+            ))
+        else:
+            actions.append(LogInfo(msg=(
+                "没有 DISPLAY 环境变量，跳过 rqt_image_view（无图形界面）")))
+
     return actions
 
 
@@ -160,6 +194,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "model_path", default_value="",
             description="覆盖 ONNX 模型路径；留空则用参数文件里的值"),
+        DeclareLaunchArgument(
+            "show_debug_image", default_value="auto",
+            description="是否自动打开 /debug 图像窗口："
+                        "auto = 跟随参数文件里的 publish_debug_image；也可填 true / false"),
         DeclareLaunchArgument(
             "start_evaluator", default_value="true",
             description="是否启动评估节点"),

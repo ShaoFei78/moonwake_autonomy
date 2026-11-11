@@ -5,7 +5,9 @@
 #include "moonwake_camera/failure_recorder.hpp"
 #include "cv_bridge/cv_bridge.h"
 #include <opencv2/opencv.hpp>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -132,6 +134,52 @@ class BuoyDetectorNode : public rclcpp::Node
           
         }
     private:
+        //每帧调用一次，用滑动窗口算实时帧率（每 0.5 秒刷新一次，数字不会乱跳）
+        void update_fps()
+        {
+            ++fps_frames_;
+            const auto now=std::chrono::steady_clock::now();
+            const double dt=std::chrono::duration<double>(now-fps_window_start_).count();
+            if(dt>=0.5){
+                fps_=fps_frames_/dt;
+                fps_frames_=0;
+                fps_window_start_=now;
+            }
+        }
+
+        //把帧率画在右上角。字号随图像高度缩放，480p/720p/1080p 都好看。
+        void draw_fps(cv::Mat &canvas,double fps)
+        {
+            const double scale=std::clamp(canvas.rows/720.0,0.5,2.0);
+            //小分辨率下也保证有 2px 描边，不然字会显得很细
+            const int thickness=std::max(2,static_cast<int>(std::round(scale*2)));
+
+            char text[32];
+            std::snprintf(text,sizeof(text),"FPS %.1f",fps);
+
+            int baseline=0;
+            const cv::Size size=cv::getTextSize(
+                text,cv::FONT_HERSHEY_SIMPLEX,scale,thickness,&baseline);
+
+            const int pad=std::max(4,static_cast<int>(std::round(scale*6)));
+            const int margin=std::max(8,static_cast<int>(std::round(scale*12)));
+
+            //文字左上角贴着右边距，基线距顶部一个文字高度
+            const int tx=std::max(pad,canvas.cols-size.width-margin-pad);
+            const int ty=std::max(size.height+pad,margin+size.height);
+
+            //半透明黑底：不管背景多亮都看得清
+            const cv::Rect box(std::max(0,tx-pad),
+                               std::max(0,ty-size.height-pad),
+                               std::min(canvas.cols,size.width+2*pad),
+                               std::min(canvas.rows,size.height+baseline+2*pad));
+            cv::rectangle(canvas,box,cv::Scalar(0,0,0),cv::FILLED);
+
+            //黄色字，和绿色的检测框区分开
+            cv::putText(canvas,text,cv::Point(tx,ty),
+                cv::FONT_HERSHEY_SIMPLEX,scale,cv::Scalar(0,255,255),thickness,cv::LINE_AA);
+        }
+
         //把检测框画到一张图上。只负责画，不参与任何检测计算。
         //注意：调用方必须传一张可以随便改的图（clone 过的），不要直接画在 cv_img 上。
         void draw_detections(cv::Mat &canvas,const std::vector<Detection> &detections)
@@ -171,6 +219,7 @@ class BuoyDetectorNode : public rclcpp::Node
         void sync_callback(const sensor_msgs::msg::Image::ConstSharedPtr img_msg,const sensor_msgs::msg::CameraInfo::ConstSharedPtr info_msg)
         {
             auto start_time =this->now();
+            update_fps();
             //
             DetectionArray output;
             output.header=img_msg->header;
@@ -271,6 +320,7 @@ class BuoyDetectorNode : public rclcpp::Node
             {
                 cv::Mat annotated=cv_img.clone();
                 draw_detections(annotated,candidates);
+                draw_fps(annotated,fps_);   //右上角显示实时帧率
                 auto annotated_msg=cv_bridge::CvImage(
                     img_msg->header,"bgr8",annotated).toImageMsg();
                 debug_image_pub_->publish(*annotated_msg);
@@ -391,6 +441,10 @@ class BuoyDetectorNode : public rclcpp::Node
         std::unique_ptr<moonwake_camera::FailureRecorder> failure_recorder_;
         //检测后端（hsv / yolo），由 detector_backend 参数决定
         std::unique_ptr<moonwake_camera::IDetector> detector_;
+        //帧率统计（只用于 debug 标注图右上角的显示）
+        std::chrono::steady_clock::time_point fps_window_start_{std::chrono::steady_clock::now()};
+        int fps_frames_{0};
+        double fps_{0.0};
         
 
 };

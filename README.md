@@ -110,7 +110,7 @@ ros2 pkg executables moonwake_camera
 | --- | --- | --- |
 | `detection` | `moonwake_camera/msg/DetectionArray` | 每帧的状态与检测结果 |
 | `debug_mask` | `sensor_msgs/msg/Image` | 二值 mask（`mono8`），需 `publish_debug_mask:=true`；**仅 `hsv` 后端有** |
-| `debug` | `sensor_msgs/msg/Image` | 检测框标注图（`bgr8`），需 `publish_debug_image:=true`（默认开） |
+| `debug` | `sensor_msgs/msg/Image` | 检测框标注图（`bgr8`），需 `publish_debug_image:=true`（默认开）；右上角叠加实时 FPS |
 
 > ⚠️ 检测结果话题是 **`detection`（单数）**，而评估脚本默认订阅 `detections`，需要显式指定。
 
@@ -229,6 +229,9 @@ ros2 launch moonwake_camera test_with_video.launch.py \
 
 同时启动「视频发布 + 检测 + 评估」，`Ctrl+C` 后自动打印统计报告并保存 CSV。
 
+如果参数文件里 `publish_debug_image: true`，**还会自动弹出一个 rqt_image_view 窗口**显示 `/debug`，
+不用再另开终端。不想开窗口可以加 `show_debug_image:=false`。
+
 默认用 `hsv` 后端。换 YOLO 后端加两个参数即可：
 
 ```bash
@@ -249,6 +252,7 @@ ros2 launch moonwake_camera test_with_video.launch.py \
 | `params_file` | 包内 `config/detector_params.yaml` | 参数文件 |
 | `detector_backend` | `''` | 覆盖检测后端（`hsv` / `yolo`）；留空用 yaml 里的值 |
 | `model_path` | `''` | 覆盖 ONNX 模型路径；留空用 yaml 里的值 |
+| `show_debug_image` | `auto` | 是否自动打开 `/debug` 窗口：`auto` = 跟随 yaml 里的 `publish_debug_image`；也可填 `true` / `false` |
 | `start_evaluator` | `true` | 是否启动评估节点 |
 | `eval_topic` | `/detection` | 评估订阅的话题 |
 | `eval_csv` | `eval_result.csv` | CSV 输出路径（相对执行目录） |
@@ -334,7 +338,8 @@ ros2 launch moonwake_camera test_with_video.launch.py \
   video:=/home/shaofei/Videos/test2.mp4 rate:=10.0
 ```
 
-另开终端看画面（不要中断 launch）：
+`publish_debug_image: true` 时窗口会**自动弹出**（显示 `/debug`，右上角有实时 FPS）。
+如果没弹出来，可以手动开：
 
 ```bash
 ros2 run rqt_image_view rqt_image_view /debug
