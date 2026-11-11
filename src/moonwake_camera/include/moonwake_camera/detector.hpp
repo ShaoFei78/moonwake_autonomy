@@ -19,10 +19,17 @@ namespace moonwake_camera
 /// 约定（两个后端必须完全一致）：
 ///   * 输入是一张 BGR 八位三通道图，尺寸任意
 ///   * 输出的 Detection 用**原图像素坐标**：
-///       class_name 类别名
+///       class_name 类别名（统一为 "green_buoy")
 ///       center     (x, y) 像素，z = 0
 ///       bbox       [x_min, y_min, x_max, y_max]
-///       score      0~1 的置信度
+///       score      0~1 的质量分，**语义由后端定义，见下**
+///   * score 的语义**由各后端自行定义，跨后端不可直接比较**：
+///       - HsvDetector：连通域填充率 = 白斑面积 / 外接框面积。
+///         越接近 1 说明形状越"方"，**不代表"有多像浮标"**；
+///         一块被填满的矩形水面反光同样会得到 1.0。
+///       - YoloDetector：模型置信度，表示"这张图里这块区域有多像训练时的浮标"。
+///     下游若按 score 过滤或排序，**必须按后端分别设定阈值**，
+///     不能把 HSV 的 0.8 理解成"80% 把握"。
 ///   * 没有目标是正常情况，返回空 vector（节点据此填 STATUS_NO_DETECTION）
 ///   * 参数非法 -> 抛 DetectorConfigError（节点填 STATUS_CONFIG_ERROR）
 ///   * 模型加载失败 / 推理失败 -> 抛 DetectorModelError（节点填 STATUS_MODEL_ERROR）
