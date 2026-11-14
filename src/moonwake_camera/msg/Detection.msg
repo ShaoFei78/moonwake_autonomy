@@ -9,3 +9,14 @@ float32[4] bbox
 #  YOLO 后端 = 模型置信度，衡量"有多像浮标"
 #下游按 score 过滤时，必须按后端分别设阈值。
 float32 score
+#---跟踪
+#轨迹编号：同一个目标在不同帧保持同一个id
+#-1表示这一帧没有跟踪信息
+#刚出现，还没确认目标也会分到一个新的id,只是track_state=TRACK_TENTATIVE
+int32 track_id -1
+#轨迹状态常量
+uint8 TRACK_TENTATIVE=0
+uint8 TRACK_CONFIRMED=1
+uint8 TRACK_LOST=2
+#本帧该目标的轨迹状态
+uint8 track_state 0

@@ -80,14 +80,14 @@ endif()
 ament_target_dependencies(buoy_detector_node rclcpp std_msgs cv_bridge sensor_msgs message_filters)
 
 # 5.1 YOLO 后端用到 OpenCV 的 dnn 模块（blobFromImage / NMSBoxes），
-#     cv_bridge 只带 core/imgproc，dnn 要显式链接
-find_package(OpenCV QUIET COMPONENTS dnn)
+#     跟踪用到video模块(cv::KalmanFilter),两个都要显式链接
+find_package(OpenCV QUIET COMPONENTS dnn video)
 if(OpenCV_FOUND)
   target_include_directories(buoy_detector_node SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS})
   target_link_libraries(buoy_detector_node ${OpenCV_LIBS})
-  message(STATUS "OpenCV dnn 已链接: ${OpenCV_LIBS}")
+  message(STATUS "OpenCV dnn/video 已链接: ${OpenCV_LIBS}")
 else()
-  message(WARNING "没找到 OpenCV dnn 模块，YOLO 后端会链接失败")
+  message(WARNING "没找到 OpenCV dnn/video 模块，YOLO 后端会链接失败")
 endif()
 
 # ⚠️ 6. 【关键步骤】将节点链接到本包生成的消息类型支持上

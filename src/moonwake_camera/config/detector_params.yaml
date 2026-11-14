@@ -30,12 +30,27 @@ buoy_detector_node:
     # 类别名，多个用逗号分隔；单类模型就是 green_buoy
     model_class_names: "green_buoy"
 
+    #--跟踪
+    #总开关:false时行为和以前完全一样(Detection.track_id 恒为-1)
+    track_enable: true
+    #连续见到几次才算确认检测到
+    track_min_hits: 3
+    #连续丢失多少帧判定为丢失
+    #30FPS下15帧大概为0.5秒
+    track_max_age: 15
+    #连续丢失多少帧率后直接删除轨迹
+    track_max_lost: 45
+    #门限一：预测框与检测框的IoU低于此之数值就不配对
+    track_iou_gate: 0.10
+    #门限二：两个框中心超过多少像素就不匹配
+    track_dist_gate: 200.0
+
     adaptive_block_size: 11
     adaptive_C: 1.5
     # ── HSV 阈值 ────────────────────────────────────────────
     # H: 0~180（对应 0~360 度）；S/V: 0~255
     h_min: 45
-    h_max: 75
+    h_max: 65
     s_min: 95
     s_max: 255
     v_min: 85
@@ -43,7 +58,7 @@ buoy_detector_node:
 
     # ── 连通域过滤 ──────────────────────────────────────────
     # 面积小于 min_area 的连通域会被丢弃，单位是像素
-    min_area: 100
+    min_area: 1200
     # 形态学核大小，getStructuringElement(MORPH_ELLIPSE, Size(k,k))
     kernel_size: 8
 

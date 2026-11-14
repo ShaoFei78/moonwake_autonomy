@@ -38,6 +38,7 @@ sudo apt install ros-humble-cv-bridge ros-humble-message-filters \
                      │  ① 分辨率一致性检查               │
                      │  ② 数据年龄检查  → INPUT_STALE    │
                      │  ③ detector_->detect(bgr)        │
+                     │  ④ 跟踪：匹配 + 分配 track_id     │
                      └──────────────┬───────────────────┘
                                     │ IDetector 抽象接口
                      ┌──────────────┴───────────────┐
@@ -49,6 +50,12 @@ sudo apt install ros-humble-cv-bridge ros-humble-message-filters \
             └─────────────────┘            └─────────────────┘
                      │ 两个后端都返回同样结构的 Detection（原图像素坐标）
                      ▼
+            ┌──────────────────────────────┐
+            │  跟踪层 (KalmanTrack)         │
+            │  IoU/距离 双门限关联，        │
+            │  TENTATIVE→CONFIRMED→LOST    │
+            └──────────────┬───────────────┘
+                           ▼
      ┌───────────────┼───────────────┬──────────────────┐
      ▼               ▼               ▼                  ▼
  detection        debug         debug_mask        failure_samples/
@@ -133,7 +140,24 @@ ros2 pkg executables moonwake_camera
 | 4 | `STATUS_CONFIG_ERROR` | 参数非法（如 `h_min >= h_max`、`model_path` 为空） |
 | 5 | `STATUS_MODEL_ERROR` | 模型加载失败 / 推理抛异常（不会伪装成 `NO_DETECTION`） |
 
-`Detection` 字段：`class_name`、`center`（像素坐标）、`bbox`（`[x_min, y_min, x_max, y_max]`）、`score`（连通域面积 / 外接框面积）。
+### `Detection` 字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `class_name` | `string` | 类别名：`hsv` 后端固定 `buoy`，`yolo` 后端取 `model_class_names` |
+| `center` | `geometry_msgs/Point` | 目标中心（原图像素坐标，`z` 恒为 0） |
+| `bbox` | `float32[4]` | `[x_min, y_min, x_max, y_max]`，原图像素坐标 |
+| `score` | `float32` | **语义随后端不同**：`hsv` = 连通域填充率（面积/外接框面积）；`yolo` = 模型置信度。跨后端不可直接比较 |
+| `track_id` | `int32` | 轨迹编号，同一目标跨帧不变；`-1` 表示本帧没有跟踪信息（如 `track_enable=false`） |
+| `track_state` | `uint8` | 本帧该目标的轨迹状态，见下表 |
+
+| 值 | 常量 | 含义 |
+| --- | --- | --- |
+| 0 | `TRACK_TENTATIVE` | 刚出现，还没连续命中足够次数 |
+| 1 | `TRACK_CONFIRMED` | 已确认的稳定轨迹 |
+| 2 | `TRACK_LOST` | 暂时丢失（超过 `track_max_age` 帧没匹配上） |
+
+> 下游如果想"只要稳定目标"，按 `track_state == TRACK_CONFIRMED` 过滤即可。
 
 ---
 
@@ -168,6 +192,26 @@ ros2 pkg executables moonwake_camera
 | `stale_threshold_sec` | `0.5` | 数据年龄阈值（秒），超过判为 `INPUT_STALE` |
 | `publish_debug_mask` | `true` | 是否发布 `debug_mask`（二值 mask） |
 | `publish_debug_image` | `true` | 是否发布 `debug`（检测框标注图） |
+
+> 上表是**代码内置默认值**。`config/detector_params.yaml` 里是针对 `test2.mp4` 实测调好的值
+> （`h_max=65`、`s_min=95`、`min_area=1200` 等），launch 默认加载它。
+> HSV 的调参闭环见 [测试流程](#测试流程) 第 4 步。
+
+### 跟踪参数
+
+跟踪层在检测**之后**运行，给每个目标分配跨帧稳定的 `track_id`（用 OpenCV 的 `cv::KalmanFilter` 做状态预测，再用「IoU 或 中心距离」双门限做数据关联）。
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `track_enable` | `true` | 总开关；`false` 时行为和没有跟踪完全一样（`track_id` 恒为 `-1`） |
+| `track_min_hits` | `3` | 连续命中多少次，才从 `TENTATIVE` 转为 `CONFIRMED` |
+| `track_max_age` | `15` | 连续丢失多少帧判定为 `LOST`（30 FPS 下约 0.5 s） |
+| `track_max_lost` | `45` | 继续丢失多少帧后直接删除该轨迹 |
+| `track_iou_gate` | `0.10` | 关联门限一：预测框与实际框的 IoU 低于此值就不配对 |
+| `track_dist_gate` | `200.0` | 关联门限二：中心点距离超过多少像素就不配对 |
+
+> ⚠️ `track_min_hits` 只能抑制"闪一下就没"的误检；
+> **一直存在的静止误检（比如船体上的绿色物体）会被稳定确认**，跟踪层替代不了检测层的过滤。
 
 ### 异常样本保存参数
 
@@ -503,3 +547,6 @@ fail_20261105_170656_758_0001_no_detection.txt        # 参数 + 状态码 + 诊
 - `yolo` 后端在 CPU 上单帧约 110~230 ms（`model_num_threads` 影响很大），实时性受限；
   想上 30 FPS 需要降输入尺寸、换 OpenVINO/CUDA EP，或上 GPU。
 - `debug_mask` 只有 `hsv` 后端产生，`yolo` 后端不发布该话题。
+- `hsv` 与 `yolo` 的 `score` **语义不同**（填充率 vs 模型置信度），下游阈值必须分后端设置。
+- 跟踪层的 `track_min_hits` 只能过滤"闪现"式误检；**静止的误检会被稳定确认**，需要靠检测层参数或 ROI 屏蔽解决。
+- `hsv` 后端的 `min_area` 是像素面积，与分辨率和拍摄距离强相关；换分辨率要按面积比例换算。
