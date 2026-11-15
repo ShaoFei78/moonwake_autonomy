@@ -89,11 +89,16 @@ struct KalmanTrack
     int hits = 0;               // 连续"见到"的次数
     int misses = 0;             // 连续"没见到"的次数
     bool confirmed = false;     // 见过够多次才算确认（防误检）
+    std::string class_name;     // 类别名。记住它，发"预测目标"时要用
+    rclcpp::Time first_stamp;   // 第一次见到的时刻，用来算 age_s
     rclcpp::Time last_stamp;    // 上一帧的时间戳，用来算 dt
+    rclcpp::Time last_seen;     // 最后一次【真正检测到】它的时刻（关联成功才更新）
     cv::KalmanFilter kf{kStateDim, kMeasDim, 0, CV_32F};
 
-    KalmanTrack(int track_id, const cv::Rect2f & box, const rclcpp::Time & stamp)
-    : id(track_id), last_stamp(stamp)
+    KalmanTrack(int track_id, const cv::Rect2f & box, const rclcpp::Time & stamp,
+                const std::string & cls)
+    : id(track_id), class_name(cls), first_stamp(stamp), last_stamp(stamp),
+      last_seen(stamp)
     {
         // ---- F：状态转移矩阵。一句话："位置 += dt × 速度，速度不变" ----
         // 先铺单位阵（表示"每个量等于它自己"），再把 4 个 dt 填进去。
@@ -181,7 +186,8 @@ struct KalmanTrack
     }
 
     // 关联成功后调一次：用检测框修正状态
-    void update(const cv::Rect2f & box, int min_hits)
+    // stamp 传进来是为了记下"最后一次真正见到它"的时刻
+    void update(const cv::Rect2f & box, int min_hits, const rclcpp::Time & stamp)
     {
         cv::Mat z(kMeasDim, 1, CV_32F);
         z.at<float>(0) = box.x + box.width * 0.5f;
@@ -192,6 +198,7 @@ struct KalmanTrack
         // correct() 内部算的就是那套：新息 -> 增益 -> 修正状态和协方差
         kf.correct(z);
 
+        last_seen = stamp;   // ★ 这一帧真的有观测
         ++hits;
         misses = 0;
         if (hits >= min_hits) {
@@ -201,8 +208,47 @@ struct KalmanTrack
 
     void mark_missed() {++misses;}
 
+    // 距离"最后一次真正见到它"过了多久（秒）。
+    // 所有跟"过期/删除"有关的判断都用它，单位是秒，和帧率无关。
+    double lost_s(const rclcpp::Time & now) const
+    {
+        const double d = (now - last_seen).seconds();
+        return d > 0.0 ? d : 0.0;
+    }
+
     // 修正后的框（关联成功之后才有意义）
     cv::Rect2f box() const {return to_rect(kf.statePost);}
+
+    // ---- 给下游看的三个量 ----
+
+    // 这条轨迹已经存在多久（秒）。跟得越久，越说明它不是误检。
+    float age_s(const rclcpp::Time & now) const
+    {
+        const float a = static_cast<float>((now - first_stamp).seconds());
+        return a > 0.0f ? a : 0.0f;
+    }
+
+    // 这条观测"什么时候彻底作废"（返回 ROS 时间的秒数）
+    //   = 最后一次真正见到它的时刻 + 允许丢失的秒数
+    // 下游拿当前的 ROS 时间跟它比，超过就该丢弃，而不是无限沿用。
+    double valid_until(double max_age_s) const
+    {
+        return last_seen.seconds() + max_age_s;
+    }
+
+    // 质量分 0~1：
+    //   ① 命中次数 / 总次数        —— 越稳越高
+    //   ② 再乘"确认进度"           —— 刚出现的轨迹不能给满分
+    // 这样：刚出现=低，连续命中=高，开始丢帧=下降
+    float quality(int min_hits) const
+    {
+        const int total = hits + misses;
+        if (total <= 0) {return 0.0f;}
+        const float base = static_cast<float>(hits) / static_cast<float>(total);
+        const float conf = std::min(
+            1.0f, static_cast<float>(hits) / static_cast<float>(std::max(1, min_hits)));
+        return base * conf;
+    }
 };
 
 // ---------------- 两个框重叠了多少 ----------------
@@ -275,14 +321,26 @@ class BuoyDetectorNode : public rclcpp::Node
           this->declare_parameter<bool>("track_enable",true);
           //连续见到几次才算"确认"。调大=更保守，调小=响应更快但可能被误检骗
           this->declare_parameter<int>("track_min_hits",3);
-          //连续丢失多少帧后判为"丢失"（这之后就不再画它的预测框）
-          this->declare_parameter<int>("track_max_age",15);
-          //连续丢失多少帧后直接删除这条轨迹（30fps 下 45 帧约 1.5 秒）
-          this->declare_parameter<int>("track_max_lost",45);
-          //门限一：预测框和检测框的 IoU 低于这个值，就不许配对
-          this->declare_parameter<double>("track_iou_gate",0.10);
-          //门限二：两个框中心距离超过这个像素数，也不许配对
-          this->declare_parameter<double>("track_dist_gate",200.0);
+          //距离"最后一次真正见到"超过这么多【秒】，就不再发布它的预测（目标视为失效）
+          this->declare_parameter<double>("track_max_age_s",0.5);
+          //距离"最后一次真正见到"超过这么多【秒】，就删除这条轨迹
+          //  调大 = 遮挡更久也能接回同一个 ID；调小 = 更快清掉幽灵轨迹
+          //  注意：这里用【秒】不用【帧】，换帧率/掉帧/bag 变速行为都一致
+          this->declare_parameter<double>("track_max_lost_s",3.0);
+          //门限一：预测框和检测框的 IoU 低于这个值，就不许配对。
+          //  半遮挡时检测框会缩水，IoU 天然偏低，所以这里只要求"有一点点重叠"
+          this->declare_parameter<double>("track_iou_gate",0.02);
+          //门限二：中心距离门限。它不是一个常数，而是"随丢失时间放宽、但有天花板"：
+          //    允许距离 = min(dist_gate_max, dist_gate + dist_gate_rate × 丢了多久)
+          //  丢得越久，预测越不可信，搜索半径就该越大；
+          //  但必须有上限，否则画面切换/误检会被硬接到老轨迹上。
+          this->declare_parameter<double>("track_dist_gate",150.0);       // 刚丢时的半径（px）
+          this->declare_parameter<double>("track_dist_gate_rate",120.0);  // 每丢 1 秒放宽多少（px/s）
+          this->declare_parameter<double>("track_dist_gate_max",400.0);   // 天花板（px）
+          //门限三：尺寸一致性。新检测的框宽 / 上次的框宽 必须落在这个区间内。
+          //  同一个小目标 2 秒内大小一般不会差一倍；换场景/换目标通常差得更多。
+          this->declare_parameter<double>("track_size_ratio_min",0.5);
+          this->declare_parameter<double>("track_size_ratio_max",2.0);
 
           //创建发布者
           result_pub_=this->create_publisher<DetectionArray>("detection",10);
@@ -324,15 +382,30 @@ class BuoyDetectorNode : public rclcpp::Node
           //这几个参数只在启动时读一次；改完要重启节点才生效
           track_enable_   = this->get_parameter("track_enable").as_bool();
           track_min_hits_ = static_cast<int>(this->get_parameter("track_min_hits").as_int());
-          track_max_age_  = static_cast<int>(this->get_parameter("track_max_age").as_int());
-          track_max_lost_ = static_cast<int>(this->get_parameter("track_max_lost").as_int());
+          track_max_age_s_ = this->get_parameter("track_max_age_s").as_double();
+          track_max_lost_s_= this->get_parameter("track_max_lost_s").as_double();
           track_iou_gate_ = static_cast<float>(this->get_parameter("track_iou_gate").as_double());
           track_dist_gate_= static_cast<float>(this->get_parameter("track_dist_gate").as_double());
+          track_dist_gate_rate_ = static_cast<float>(
+              this->get_parameter("track_dist_gate_rate").as_double());
+          track_dist_gate_max_ = static_cast<float>(
+              this->get_parameter("track_dist_gate_max").as_double());
+          track_size_ratio_min_ = static_cast<float>(
+              this->get_parameter("track_size_ratio_min").as_double());
+          track_size_ratio_max_ = static_cast<float>(
+              this->get_parameter("track_size_ratio_max").as_double());
           if(track_enable_){
               RCLCPP_INFO(this->get_logger(),
-                  "tracking: ON (min_hits=%d, max_age=%d, max_lost=%d, iou_gate=%.2f, dist_gate=%.1f)",
-                  track_min_hits_,track_max_age_,track_max_lost_,
-                  static_cast<double>(track_iou_gate_),static_cast<double>(track_dist_gate_));
+                  "tracking: ON (min_hits=%d, max_age=%.2fs, max_lost=%.2fs)",
+                  track_min_hits_,track_max_age_s_,track_max_lost_s_);
+              RCLCPP_INFO(this->get_logger(),
+                  "  gate: iou>=%.2f, dist<=min(%.0f, %.0f+%.0f*lost), size_ratio in [%.2f, %.2f]",
+                  static_cast<double>(track_iou_gate_),
+                  static_cast<double>(track_dist_gate_max_),
+                  static_cast<double>(track_dist_gate_),
+                  static_cast<double>(track_dist_gate_rate_),
+                  static_cast<double>(track_size_ratio_min_),
+                  static_cast<double>(track_size_ratio_max_));
           }else{
               RCLCPP_INFO(this->get_logger(),"tracking: OFF (track_enable=false)");
           }
@@ -428,16 +501,18 @@ class BuoyDetectorNode : public rclcpp::Node
         }
 
         // ==================== 跟踪主流程 ====================
-        // 输入：这一帧的检测结果（会被就地写上 track_id / track_state）
-        // 输出：这一帧"轨迹还活着、但没检测到"的预测框（只用于画图提示）
+        // 输入：这一帧的检测结果（会被就地写上 track_id / track_state / age_s /
+        //       valid_until / quality）
+        // 输出：这一帧"只有预测、没有观测"的目标（track_state = TRACK_LOST）。
+        //       它们会放进 DetectionArray.predicted_tracks，和真实观测分开发布。
         //
         // 顺序很重要：先【预测】全部轨迹，再【关联】，最后【更新/新建/淘汰】。
         // 如果反过来先关联再预测，用的就是上一帧的位置，关联会一直慢一拍。
-        std::vector<std::pair<cv::Rect2f,int>> update_tracks(
+        std::vector<Detection> update_tracks(
             std::vector<Detection> & dets,const rclcpp::Time & stamp)
         {
-            std::vector<std::pair<cv::Rect2f,int>> missed_out;
-            if(!track_enable_) return missed_out;
+            std::vector<Detection> predicted;
+            if(!track_enable_) return predicted;
 
             // ---------- ① 所有轨迹先往前猜一步 ----------
             std::vector<cv::Rect2f> preds;
@@ -466,6 +541,16 @@ class BuoyDetectorNode : public rclcpp::Node
             struct Pair {int ti; int di; float iou;};
             std::vector<Pair> cand;
             for(size_t ti=0; ti<preds.size(); ++ti){
+                // 这条轨迹已经"丢了多久"（秒）。刚跟丢是 0，越久越大。
+                const float lost_s = static_cast<float>(tracks_[ti]->lost_s(stamp));
+
+                // 距离门限不是一个常数，而是随丢失时间放宽、并有天花板：
+                //   丢得越久 → 预测越不可信 → 允许的搜索半径越大
+                //   但封顶在 max，防止"画面一换就把新目标接到老轨迹上"
+                const float dist_gate = std::min(
+                    track_dist_gate_max_,
+                    track_dist_gate_ + track_dist_gate_rate_ * lost_s);
+
                 for(size_t di=0; di<boxes.size(); ++di){
                     const float iou = box_iou(preds[ti],boxes[di]);
 
@@ -474,13 +559,20 @@ class BuoyDetectorNode : public rclcpp::Node
                     // 结果就是 ID 乱跳（这比不跟踪还糟）。
                     if(iou < track_iou_gate_) continue;
 
-                    // 门限二：中心离太远也不许配。
-                    // 主要防"画面整体平移"（船一转弯，所有框一起动）。
+                    // 门限二：中心离太远也不许配（半径见上面的 dist_gate）。
                     const float dx = (preds[ti].x + preds[ti].width *0.5f)
                                    - (boxes[di].x + boxes[di].width *0.5f);
                     const float dy = (preds[ti].y + preds[ti].height*0.5f)
                                    - (boxes[di].y + boxes[di].height*0.5f);
-                    if(std::sqrt(dx*dx + dy*dy) > track_dist_gate_) continue;
+                    if(std::sqrt(dx*dx + dy*dy) > dist_gate) continue;
+
+                    // 门限三：尺寸一致性。
+                    // 同一个小目标在一两秒内大小不会差一倍；
+                    // 换场景/换目标时框宽常常差很多，这一条比距离更能挡住"错配"。
+                    // 用上一次看到的框宽做基准（预测框的宽高来自卡尔曼，也同样可用）。
+                    const float old_w = std::max(1.0f,preds[ti].width);
+                    const float ratio = boxes[di].width / old_w;
+                    if(ratio < track_size_ratio_min_ || ratio > track_size_ratio_max_) continue;
 
                     cand.push_back({static_cast<int>(ti),static_cast<int>(di),iou});
                 }
@@ -495,7 +587,7 @@ class BuoyDetectorNode : public rclcpp::Node
                 track_used[c.ti] = 1;
                 det_used[c.di]   = 1;
                 det2track[c.di]  = c.ti;
-                tracks_[c.ti]->update(boxes[c.di],track_min_hits_);
+                tracks_[c.ti]->update(boxes[c.di],track_min_hits_,stamp);
             }
 
             // ---------- ④ 没配上的轨迹：记一笔"这帧没见到" ----------
@@ -503,10 +595,32 @@ class BuoyDetectorNode : public rclcpp::Node
                 if(track_used[ti]) continue;
                 auto & t = *tracks_[ti];
                 t.mark_missed();
-                // 已确认的轨迹，即使这帧没检测到，也把预测框留下来画图。
-                // 这就是"跟踪能补漏检"的可视化：人能看到框还在，ID 没变。
-                if(t.confirmed && t.misses <= track_max_age_){
-                    missed_out.emplace_back(preds[ti],t.id);
+
+                // 已确认的轨迹，即使这帧没检测到，也要发布一条"预测目标"。
+                // 这是文档要求的："遮挡时可以短时预测，但必须发布预测年龄和不确定度"。
+                // 距离最后一次真正见到超过 max_age_s 之后就不再发（目标视为失效），
+                // 但轨迹本身还留到 max_lost_s 才删，方便它再出现时接回同一个 ID。
+                if(t.confirmed && t.lost_s(stamp) <= track_max_age_s_){
+                    Detection p;
+                    p.class_name  = t.class_name;
+                    p.track_id    = t.id;
+                    p.track_state = Detection::TRACK_LOST;   // 明确：这条是预测，不是观测
+                    p.age_s       = t.age_s(stamp);
+                    p.valid_until = t.valid_until(track_max_age_s_);
+                    p.quality     = t.quality(track_min_hits_);
+                    // 没有本帧检测支撑，score 就用质量分顶上（字段注释里写明了）
+                    p.score       = p.quality;
+
+                    const cv::Rect2f b = t.box();   // 卡尔曼预测出来的框
+                    p.bbox[0] = b.x;
+                    p.bbox[1] = b.y;
+                    p.bbox[2] = b.x + b.width;
+                    p.bbox[3] = b.y + b.height;
+                    p.center.x = b.x + b.width  * 0.5f;
+                    p.center.y = b.y + b.height * 0.5f;
+                    p.center.z = 0.0;
+
+                    predicted.push_back(p);
                 }
             }
 
@@ -514,48 +628,56 @@ class BuoyDetectorNode : public rclcpp::Node
             for(size_t di=0; di<boxes.size(); ++di){
                 if(det_used[di]) continue;
                 tracks_.push_back(std::make_unique<KalmanTrack>(
-                    next_track_id_++,boxes[di],stamp));
+                    next_track_id_++,boxes[di],stamp,dets[di].class_name));
                 det2track[di] = static_cast<int>(tracks_.size()-1);
             }
 
-            // ---------- ⑥ 把编号写回检测结果 ----------
+            // ---------- ⑥ 把编号和时效写回检测结果 ----------
             for(size_t di=0; di<dets.size(); ++di){
                 const int ti = det2track[di];
                 if(ti < 0) continue;
-                dets[di].track_id = tracks_[ti]->id;
-                dets[di].track_state = tracks_[ti]->confirmed
+                const auto & t = *tracks_[ti];
+                dets[di].track_id    = t.id;
+                dets[di].track_state = t.confirmed
                     ? Detection::TRACK_CONFIRMED
                     : Detection::TRACK_TENTATIVE;
+                dets[di].age_s       = t.age_s(stamp);
+                dets[di].valid_until = t.valid_until(track_max_age_s_);
+                dets[di].quality     = t.quality(track_min_hits_);
             }
 
             // ---------- ⑦ 淘汰 ----------
             // 两种情况删：
             //   * 从没确认过、又连续丢了 min_hits 次 —— 多半是单帧误检
-            //   * 确认过但丢了太久（max_lost 帧）—— 目标真的走了
+            //   * 确认过但"最后一次见到"已经超过 max_lost_s —— 目标真的走了
+            // 全部用【秒】判断，换帧率、bag 变速、掉帧都不会改变行为。
             tracks_.erase(
                 std::remove_if(tracks_.begin(),tracks_.end(),
-                    [this](const std::unique_ptr<KalmanTrack> & t){
+                    [this,&stamp](const std::unique_ptr<KalmanTrack> & t){
                         if(!t->confirmed && t->misses >= track_min_hits_) return true;
-                        return t->misses > track_max_lost_;
+                        return t->lost_s(stamp) > track_max_lost_s_;
                     }),
                 tracks_.end());
 
-            return missed_out;
+            return predicted;
         }
 
         // 把"这一帧没检测到、但轨迹还在预测"的框画成橙色。
-        // 只是给人看，不参与任何计算。
+        // 只是给人看，不参与任何计算。标签里的 q 是质量分。
         void draw_missed_tracks(cv::Mat &canvas,
-            const std::vector<std::pair<cv::Rect2f,int>> & missed) const
+            const std::vector<Detection> & missed) const
         {
-            for(const auto & m : missed){
-                const cv::Rect2f & b = m.first;
-                cv::rectangle(canvas,
-                    cv::Point(static_cast<int>(b.x),static_cast<int>(b.y)),
-                    cv::Point(static_cast<int>(b.x+b.width),static_cast<int>(b.y+b.height)),
+            for(const auto & d : missed){
+                const int x1=static_cast<int>(d.bbox[0]);
+                const int y1=static_cast<int>(d.bbox[1]);
+                const int x2=static_cast<int>(d.bbox[2]);
+                const int y2=static_cast<int>(d.bbox[3]);
+                cv::rectangle(canvas,cv::Point(x1,y1),cv::Point(x2,y2),
                     cv::Scalar(0,165,255),2);   // 橙色 = 预测（本帧没有检测到）
-                cv::putText(canvas,"P"+std::to_string(m.second),
-                    cv::Point(static_cast<int>(b.x),std::max(12,static_cast<int>(b.y)-6)),
+                const std::string label="P"+std::to_string(d.track_id)+
+                    " q"+format_double(d.quality,2);
+                cv::putText(canvas,label,
+                    cv::Point(x1,std::max(12,y1-6)),
                     cv::FONT_HERSHEY_SIMPLEX,0.5,cv::Scalar(0,165,255),1,cv::LINE_AA);
             }
         }
@@ -635,7 +757,8 @@ class BuoyDetectorNode : public rclcpp::Node
             //------------ 跟踪：给检测结果分配 track_id ------------
             // 即使这一帧 candidates 是空的，也必须调用：
             // 要让已有轨迹"变老"，下一帧目标再出现时才能认出是同一个（ID 不变）。
-            const auto missed_preds =
+            // 返回的是"只有预测、没有观测"的目标（track_state = TRACK_LOST）。
+            const auto predicted =
                 update_tracks(candidates,rclcpp::Time(img_msg->header.stamp));
 
             //计算耗时（含检测 + 跟踪，也就是下游真正感受到的整帧耗时）
@@ -647,6 +770,11 @@ class BuoyDetectorNode : public rclcpp::Node
                 output.status=DetectionArray::STATUS_DETECTED;
                 output.detections=candidates;
             }
+            // 预测目标单独放一个数组：
+            //   detections      = 本帧真实观测（status=DETECTED 时才有）
+            //   predicted_tracks= 没观测到、但轨迹还在预测的目标（可能为空）
+            // 两者分开，下游不会把"猜的"当成"看到的"。
+            output.predicted_tracks=predicted;
             result_pub_->publish(output);
             //没检测到目标时存一份样本：此时 mask（如果后端有）是真实的，最适合拿来调阈值
             if(output.status==DetectionArray::STATUS_NO_DETECTION){
@@ -671,7 +799,7 @@ class BuoyDetectorNode : public rclcpp::Node
                 cv::Mat annotated=cv_img.clone();
                 draw_detections(annotated,candidates);
                 //橙色框 = 本帧没检测到、但轨迹还在预测（跟踪在补漏检）
-                draw_missed_tracks(annotated,missed_preds);
+                draw_missed_tracks(annotated,predicted);
                 draw_fps(annotated,fps_);   //右上角显示实时帧率
                 auto annotated_msg=cv_bridge::CvImage(
                     img_msg->header,"bgr8",annotated).toImageMsg();
@@ -694,8 +822,9 @@ class BuoyDetectorNode : public rclcpp::Node
                                       "adaptive_block_size","adaptive_C",
                                       "model_path","model_conf_threshold","model_iou_threshold",
                                       "model_input_size","model_num_threads","model_class_names",
-                                      "track_enable","track_min_hits","track_max_age","track_max_lost",
-                                      "track_iou_gate","track_dist_gate",
+                                      "track_enable","track_min_hits","track_max_age_s","track_max_lost_s",
+                                      "track_iou_gate","track_dist_gate","track_dist_gate_rate",
+                                      "track_dist_gate_max","track_size_ratio_min","track_size_ratio_max",
                                       "publish_debug_mask","publish_debug_image"}) {
                 kv.emplace_back(name,this->get_parameter(name).value_to_string());
             }
@@ -800,10 +929,16 @@ class BuoyDetectorNode : public rclcpp::Node
         //参数在构造时读一次（不在每帧读，省开销；改完要重启节点）
         bool  track_enable_{true};
         int   track_min_hits_{3};
-        int   track_max_age_{15};
-        int   track_max_lost_{45};
-        float track_iou_gate_{0.10f};
-        float track_dist_gate_{200.0f};
+        double track_max_age_s_{0.5};
+        double track_max_lost_s_{3.0};
+        float track_iou_gate_{0.02f};
+        //距离门限：base + rate × 丢了多久，封顶 max
+        float track_dist_gate_{150.0f};
+        float track_dist_gate_rate_{120.0f};
+        float track_dist_gate_max_{400.0f};
+        //尺寸一致性：新框宽 / 旧框宽 必须落在这个区间
+        float track_size_ratio_min_{0.5f};
+        float track_size_ratio_max_{2.0f};
         //所有活着的轨迹。用 unique_ptr 是因为 cv::KalmanFilter 不便宜，
         //而且 vector 扩容时指针不会失效
         std::vector<std::unique_ptr<KalmanTrack>> tracks_;

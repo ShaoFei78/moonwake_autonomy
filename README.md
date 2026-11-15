@@ -1,6 +1,8 @@
 # Moonwake Autonomy
 
-基于 **ROS 2 Humble + OpenCV** 的视觉检测工作区，目前只包含一个包 `moonwake_camera`：用 HSV 阈值 + 连通域分析从相机图像中检测浮标，并附带失败样本记录、参数调试和性能评估工具。
+基于 **ROS 2 Humble + OpenCV** 的视觉检测工作区，目前只包含一个包 `moonwake_camera`：
+用 **HSV 阈值**或 **YOLO11（ONNX）** 从相机图像中检测浮标，并用**卡尔曼滤波 + 数据关联**给出跨帧稳定的目标编号，
+附带失败样本记录、参数调试和性能评估工具。
 
 > 尚未接入真实相机，可用视频文件代替，见 [测试脚本](#测试脚本)。
 
@@ -38,7 +40,6 @@ sudo apt install ros-humble-cv-bridge ros-humble-message-filters \
                      │  ① 分辨率一致性检查               │
                      │  ② 数据年龄检查  → INPUT_STALE    │
                      │  ③ detector_->detect(bgr)        │
-                     │  ④ 跟踪：匹配 + 分配 track_id     │
                      └──────────────┬───────────────────┘
                                     │ IDetector 抽象接口
                      ┌──────────────┴───────────────┐
@@ -50,12 +51,6 @@ sudo apt install ros-humble-cv-bridge ros-humble-message-filters \
             └─────────────────┘            └─────────────────┘
                      │ 两个后端都返回同样结构的 Detection（原图像素坐标）
                      ▼
-            ┌──────────────────────────────┐
-            │  跟踪层 (KalmanTrack)         │
-            │  IoU/距离 双门限关联，        │
-            │  TENTATIVE→CONFIRMED→LOST    │
-            └──────────────┬───────────────┘
-                           ▼
      ┌───────────────┼───────────────┬──────────────────┐
      ▼               ▼               ▼                  ▼
  detection        debug         debug_mask        failure_samples/
@@ -66,6 +61,10 @@ sudo apt install ros-humble-cv-bridge ros-humble-message-filters \
 ```
 
 ---
+
+> 检测之后还有一步**目标跟踪**：给每个框分配跨帧稳定的 `track_id`，并给出
+> `age_s` / `valid_until` / `quality`。短时遮挡时会通过 `predicted_tracks` 发布预测。
+> 详见 [目标跟踪](#目标跟踪)。
 
 ## 包结构
 
@@ -127,8 +126,9 @@ ros2 pkg executables moonwake_camera
 | --- | --- | --- |
 | `header` | `std_msgs/Header` | 继承输入图像的时间戳与坐标系 |
 | `status` | `uint8` | 本帧状态码，见下表 |
-| `detections` | `Detection[]` | 目标列表 |
-| `process_time_ms` | `float32` | 本帧算法耗时 |
+| `detections` | `Detection[]` | **本帧真实观测到的**目标（可能为空） |
+| `predicted_tracks` | `Detection[]` | 本帧**只有预测、没有观测**的目标（`track_state = TRACK_LOST`），可能为空 |
+| `process_time_ms` | `float32` | 本帧算法耗时（含检测 + 跟踪） |
 | `data_age_ms` | `float32` | 数据年龄（now − 图像时间戳） |
 
 | 值 | 常量 | 含义 |
@@ -140,24 +140,9 @@ ros2 pkg executables moonwake_camera
 | 4 | `STATUS_CONFIG_ERROR` | 参数非法（如 `h_min >= h_max`、`model_path` 为空） |
 | 5 | `STATUS_MODEL_ERROR` | 模型加载失败 / 推理抛异常（不会伪装成 `NO_DETECTION`） |
 
-### `Detection` 字段
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `class_name` | `string` | 类别名：`hsv` 后端固定 `buoy`，`yolo` 后端取 `model_class_names` |
-| `center` | `geometry_msgs/Point` | 目标中心（原图像素坐标，`z` 恒为 0） |
-| `bbox` | `float32[4]` | `[x_min, y_min, x_max, y_max]`，原图像素坐标 |
-| `score` | `float32` | **语义随后端不同**：`hsv` = 连通域填充率（面积/外接框面积）；`yolo` = 模型置信度。跨后端不可直接比较 |
-| `track_id` | `int32` | 轨迹编号，同一目标跨帧不变；`-1` 表示本帧没有跟踪信息（如 `track_enable=false`） |
-| `track_state` | `uint8` | 本帧该目标的轨迹状态，见下表 |
-
-| 值 | 常量 | 含义 |
-| --- | --- | --- |
-| 0 | `TRACK_TENTATIVE` | 刚出现，还没连续命中足够次数 |
-| 1 | `TRACK_CONFIRMED` | 已确认的稳定轨迹 |
-| 2 | `TRACK_LOST` | 暂时丢失（超过 `track_max_age` 帧没匹配上） |
-
-> 下游如果想"只要稳定目标"，按 `track_state == TRACK_CONFIRMED` 过滤即可。
+`Detection` 字段：`class_name`、`center`（像素坐标）、`bbox`（`[x_min, y_min, x_max, y_max]`）、`score`
+（语义由后端定义，跨后端不可直接比较：hsv = 连通域填充率，yolo = 模型置信度），
+以及跟踪字段 `track_id` / `track_state` / `age_s` / `valid_until` / `quality`（见 [目标跟踪](#目标跟踪)）。
 
 ---
 
@@ -176,7 +161,8 @@ ros2 pkg executables moonwake_camera
 | `model_class_names` | `green_buoy` | 类别名，多个用逗号分隔 |
 
 > 两个后端产出的 `Detection` 结构完全一致（`class_name` / `center` / `bbox` / `score`，均为原图像素坐标），
-> 下游无需关心用的是哪个。`hsv` 的 `class_name` 固定为 `buoy`，`yolo` 取 `model_class_names`。
+> 下游无需关心用的是哪个。**`class_name` 统一为 `green_buoy`**（与数据集 `classes.txt` 一致），
+> `yolo` 后端从 `model_class_names` 读取，`hsv` 后端固定填同一个值。
 
 ### 检测参数
 
@@ -192,26 +178,6 @@ ros2 pkg executables moonwake_camera
 | `stale_threshold_sec` | `0.5` | 数据年龄阈值（秒），超过判为 `INPUT_STALE` |
 | `publish_debug_mask` | `true` | 是否发布 `debug_mask`（二值 mask） |
 | `publish_debug_image` | `true` | 是否发布 `debug`（检测框标注图） |
-
-> 上表是**代码内置默认值**。`config/detector_params.yaml` 里是针对 `test2.mp4` 实测调好的值
-> （`h_max=65`、`s_min=95`、`min_area=1200` 等），launch 默认加载它。
-> HSV 的调参闭环见 [测试流程](#测试流程) 第 4 步。
-
-### 跟踪参数
-
-跟踪层在检测**之后**运行，给每个目标分配跨帧稳定的 `track_id`（用 OpenCV 的 `cv::KalmanFilter` 做状态预测，再用「IoU 或 中心距离」双门限做数据关联）。
-
-| 参数 | 默认值 | 含义 |
-| --- | --- | --- |
-| `track_enable` | `true` | 总开关；`false` 时行为和没有跟踪完全一样（`track_id` 恒为 `-1`） |
-| `track_min_hits` | `3` | 连续命中多少次，才从 `TENTATIVE` 转为 `CONFIRMED` |
-| `track_max_age` | `15` | 连续丢失多少帧判定为 `LOST`（30 FPS 下约 0.5 s） |
-| `track_max_lost` | `45` | 继续丢失多少帧后直接删除该轨迹 |
-| `track_iou_gate` | `0.10` | 关联门限一：预测框与实际框的 IoU 低于此值就不配对 |
-| `track_dist_gate` | `200.0` | 关联门限二：中心点距离超过多少像素就不配对 |
-
-> ⚠️ `track_min_hits` 只能抑制"闪一下就没"的误检；
-> **一直存在的静止误检（比如船体上的绿色物体）会被稳定确认**，跟踪层替代不了检测层的过滤。
 
 ### 异常样本保存参数
 
@@ -367,6 +333,116 @@ BGR → letterbox 640（等比缩放，灰边 114，居中）
     → conf 过滤 + NMSBoxes(iou=0.7)
     → 坐标还原：先减 pad，再除 scale
 ```
+
+---
+
+## 目标跟踪
+
+检测器每帧只说“这儿有个框”，不知道“这是不是上一帧那个”。跟踪器补上**身份**，
+让下游能说“1 号浮标往左了”，而不是“又冒出来一个浮标”。
+
+实现直接写在 `buoy_detector_node.cpp` 里（`KalmanTrack` + `update_tracks()`），没有单独节点。
+
+### 一帧里的顺序
+
+```text
+① 全部轨迹先预测（卡尔曼 predict）
+② 检测框 → 几何框
+③ 数据关联：贪心匹配 + 三重门限
+④ 没配上的轨迹 → misses++，已确认的发布一条 predicted_tracks（TRACK_LOST）
+⑤ 没配上的检测 → 新建轨迹（TENTATIVE）
+⑥ 把 track_id / age_s / valid_until / quality 写回 detections
+⑦ 淘汰：误检快速删，真丢失等 max_lost_s 才删
+```
+
+### 状态模型
+
+8 维卡尔曼状态，单位是**秒**（`dt` 由 `header.stamp` 计算，与帧率无关）：
+
+```text
+x = [cx, cy, w, h, vx, vy, vw, vh]      观测 z = [cx, cy, w, h]
+```
+
+速度不是直接测出来的，是从“位置随时间的变化”推出来的。
+
+### 对外字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `track_id` | 跨帧稳定的编号，只增不减；`-1` 表示没有跟踪信息（`track_enable:=false`） |
+| `track_state` | `TRACK_TENTATIVE`(0) 刚出现 / `TRACK_CONFIRMED`(1) 已确认 / `TRACK_LOST`(2) 只有预测 |
+| `age_s` | 这条轨迹已经存在多久（秒） |
+| `valid_until` | 观测有效期（ROS 时间秒）。**下游必须检查**：超过就该丢弃 |
+| `quality` | 0~1 质量分 = `命中/(命中+丢失) × min(1, 命中/min_hits)` |
+
+> `predicted_tracks` 里的框**不是观测**：位置来自卡尔曼预测，`score` 等于 `quality`。
+> 下游只要真实观测的话，可以完全忽略这个数组。
+
+### 生命周期与两个时间点
+
+```text
+TENTATIVE ──连续命中 min_hits 次──► CONFIRMED
+                                      │
+                   超过 max_age_s 没见到│（停止发布 predicted_tracks）
+                                      ▼
+                                    LOST
+                                      │
+                    超过 max_lost_s 没见到│（删除轨迹）
+                                      ▼
+                                   DELETED
+```
+
+**“停止发布”和“删除”是两个不同的时间点**，中间那段“沉默期”专门用来在目标重新出现时接回原 ID。
+
+### 参数
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `track_enable` | `true` | 总开关；关掉后 `track_id` 恒为 `-1`，行为与加跟踪前完全一致 |
+| `track_min_hits` | `3` | 连续命中几次才确认 |
+| `track_max_age_s` | `0.5` | 超过这么多秒没见到 → 停止发布预测 |
+| `track_max_lost_s` | `3.0` | 超过这么多秒没见到 → 删除轨迹（调大可容忍更久遮挡） |
+| `track_iou_gate` | `0.02` | IoU 低于此值不许配对（半遮挡时框会缩水，所以只要求“有一点点重叠”） |
+| `track_dist_gate` | `150.0` | 距离门限的**基数**（px） |
+| `track_dist_gate_rate` | `120.0` | 每丢失 1 秒，半径放宽多少（px/s） |
+| `track_dist_gate_max` | `400.0` | 半径**天花板**（px），防止画面切换时乱配 |
+| `track_size_ratio_min` / `max` | `0.5` / `2.0` | 新框宽 / 旧框宽 必须落在这个区间 |
+
+实际使用的距离门限：
+
+```text
+允许距离 = min(track_dist_gate_max, track_dist_gate + track_dist_gate_rate × 丢失秒数)
+```
+
+丢得越久，预测越不可信，搜索半径越大；但**必须有上限**，否则任何检测都会被硬接到老轨迹上。
+
+### 为什么门限要随时间放宽
+
+固定门限在物理上说不通：刚丢 0.1 秒时预测很准，门限该严；丢了 2.5 秒时预测漂得厉害，门限该松。
+用同一个常数，必然一边太松一边太紧——**遮挡 1~2 秒后 ID 就会断**。
+
+### 调参建议
+
+| 症状 | 先调这个 |
+| --- | --- |
+| 遮挡后 ID 断开 | `track_max_lost_s` 调大；或 `track_dist_gate_rate` 调大 |
+| 画面切换/误检被接到老轨迹上 | `track_dist_gate_max` 调小 |
+| ID 频繁跳变 | `track_iou_gate` 调小、`track_dist_gate` 调大 |
+| 一个目标出现两条轨迹 | `track_iou_gate` 调大 |
+| 误检也占了 ID | `track_min_hits` 调大 |
+
+`track_max_lost_s` 不要拍脑袋：量一批实际视频里“浮标被遮挡的时长”，取 **P95** 再乘 1.2。
+
+### 怎么验证跟踪是否正常
+
+| 测试 | 期望 |
+| --- | --- |
+| 正常跟拍 | 一段视频里只有 1 个 `track_id`；`age_s` 一直增长 |
+| 短时遮挡（< `max_lost_s`） | 遮挡期间出现橙色 `P<id>` 预测框；恢复后 **ID 不变** |
+| 超过 `max_lost_s` | `predicted_tracks` 变空（目标失效），恢复后是新 ID |
+| 快速转向 | ID 不应频繁跳变 |
+
+`/debug` 图里：**绿色框 + `ID3`** 是真实观测，**橙色框 + `P3 q0.6`** 是纯预测（带质量分）。
 
 ---
 
@@ -547,6 +623,16 @@ fail_20261105_170656_758_0001_no_detection.txt        # 参数 + 状态码 + 诊
 - `yolo` 后端在 CPU 上单帧约 110~230 ms（`model_num_threads` 影响很大），实时性受限；
   想上 30 FPS 需要降输入尺寸、换 OpenVINO/CUDA EP，或上 GPU。
 - `debug_mask` 只有 `hsv` 后端产生，`yolo` 后端不发布该话题。
-- `hsv` 与 `yolo` 的 `score` **语义不同**（填充率 vs 模型置信度），下游阈值必须分后端设置。
-- 跟踪层的 `track_min_hits` 只能过滤"闪现"式误检；**静止的误检会被稳定确认**，需要靠检测层参数或 ROI 屏蔽解决。
-- `hsv` 后端的 `min_area` 是像素面积，与分辨率和拍摄距离强相关；换分辨率要按面积比例换算。
+
+### 跟踪相关
+
+- **纯几何关联**：只用了 IoU / 中心距离 / 尺寸一致性，没有外观特征（ReID）。
+  如果两个目标的位置和大小都很接近（例如两个浮标并排），无法可靠区分。
+- **门限是近似**：用“随丢失时间线性放宽 + 天花板”近似卡尔曼协方差增长，
+  不是严格的马氏距离门控。实现简单、好调，但在长时间遮挡后不是最优。
+- **`Q` / `R` 是经验值**，尚未用实船数据标定。`R` 假设检测框抖动约 ±5 px，
+  `Q` 按“匀速模型 + 船体晃动”估。后续应实测：静止目标测 `R`，用跟踪误差反推 `Q`。
+- **未做多目标交叉测试**：当前数据集每张图只有一个浮标，两目标交叉、互相遮挡的场景尚未验证。
+- **`track_id` 的连续性依赖参数**：`track_max_lost_s` 设得比实际遮挡时长短，就会换 ID（这是设计行为，不是 bug）。
+- **时间戳依赖**：所有超时判断都用 `header.stamp`。若发布端送的是当前时间（`video_publisher.py` 默认如此），
+  用 `ros2 bag play` 回放时需加 `use_sim_time:=true`，否则轨迹会被瞬间判超时。
